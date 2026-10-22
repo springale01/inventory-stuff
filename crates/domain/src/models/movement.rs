@@ -1,12 +1,30 @@
 use chrono::Utc;
 
-use crate::{Request, models::stock::Item, tools::id::Id};
+use crate::{
+    Request,
+    models::stock::Item,
+    tools::{
+        id::Id,
+        units::{Grams, Quantity},
+    },
+};
 
 #[derive(Debug, Clone)]
 pub enum MovementKind {
-    Received,
+    Received { recevied_type: ReceivedType },
     Removed,
     Corrected,
+}
+#[derive(Debug, Clone)]
+pub enum ReceivedType {
+    Singular,
+    Packaged {
+        amount: u64,
+    },
+    Bulk {
+        weight: Quantity<Grams>,
+        individual_weight: Option<Quantity<Grams>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -30,3 +48,5 @@ pub struct Correction {
 impl Request for Correction {
     type Response = Movement;
 }
+
+pub struct Remove {}
