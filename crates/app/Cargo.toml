@@ -1,0 +1,11 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+persistance = { path = "../persistance" }
+domain = { path = "../domain" }
+settings = { path = "../settings" }
+arc-swap.workspace = true
+tokio.workspace = true

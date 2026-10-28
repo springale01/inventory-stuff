@@ -85,6 +85,8 @@ pub struct Quantity<U: Unit> {
 }
 
 impl<U: Unit> Quantity<U> {
+    /// Validates a measurement. Zero is allowed for balances; commands separately
+    /// enforce positive adjustments. Whole-item counts use integers instead.
     pub fn new(value: f64) -> Result<Self, QuantityError> {
         if !value.is_finite() || value < 0.0 {
             return Err(QuantityError::InvalidValue);
@@ -95,10 +97,12 @@ impl<U: Unit> Quantity<U> {
         })
     }
 
+    /// Reads the value in `U`, without converting it to a different unit.
     pub fn value(self) -> f64 {
         self.value
     }
 
+    /// Converts within the same dimension. Kilograms to liters is a compile error.
     pub fn convert<V: Unit<Dimension = U::Dimension>>(self) -> Result<Quantity<V>, QuantityError> {
         let value = self.value * (U::BASE_UNITS / V::BASE_UNITS);
         if self.value > 0.0 && value == 0.0 {
@@ -110,6 +114,7 @@ impl<U: Unit> Quantity<U> {
         Quantity::<V>::new(value)
     }
 
+    /// Adds measurements in the same unit, checking overflow.
     pub fn checked_add(self, other: Self) -> Result<Self, QuantityError> {
         let value = self.value + other.value;
         if !value.is_finite() {
@@ -118,6 +123,7 @@ impl<U: Unit> Quantity<U> {
         Self::new(value)
     }
 
+    /// Subtracts without allowing a negative measurement.
     pub fn checked_sub(self, other: Self) -> Result<Self, QuantityError> {
         if other.value > self.value {
             return Err(QuantityError::InsufficientQuantity);

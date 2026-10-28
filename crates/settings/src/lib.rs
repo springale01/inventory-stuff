@@ -7,24 +7,32 @@ use arc_swap::{ArcSwap, Guard};
 use crate::{
     database::DatabaseSettings,
     langs::{Language, LanguagePack},
+    runtime::RuntimeSettings,
 };
 
 pub mod database;
 pub mod langs;
+mod runtime;
 
 /// Shared settings with atomic language replacement.
 pub struct Settings {
     language: ArcSwap<LanguagePack>,
     database: DatabaseSettings,
+    runtime: RuntimeSettings,
 }
 
 impl Settings {
-    pub fn new(pack: Option<LanguagePack>, database: DatabaseSettings) -> Self {
+    pub fn new(
+        pack: Option<LanguagePack>,
+        database: DatabaseSettings,
+        runtime: RuntimeSettings,
+    ) -> Self {
         let pack = pack.unwrap_or_default();
 
         Self {
             language: ArcSwap::from_pointee(pack),
             database,
+            runtime,
         }
     }
 
@@ -40,11 +48,19 @@ impl Settings {
     pub fn database_settings(&self) -> &DatabaseSettings {
         &self.database
     }
+
+    pub fn runtime_settings(&self) -> &RuntimeSettings {
+        &self.runtime
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self::new(None, DatabaseSettings::default())
+        Self::new(
+            None,
+            DatabaseSettings::default(),
+            RuntimeSettings::default(),
+        )
     }
 }
 
@@ -59,7 +75,7 @@ mod tests {
             url: "sqlite::memory:".into(),
             max_connections: 1,
         };
-        let settings = Settings::new(None, database);
+        let settings = Settings::new(None, database, RuntimeSettings::default());
         let before = settings.lang();
         let custom = HashMapDictionary::new([(TextKey::TuiName, "Custom inventory".into())]);
         settings.swap_lang(custom.into_language_pack());
