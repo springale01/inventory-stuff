@@ -9,7 +9,7 @@ macro_rules! dataclass {
     };
 }
 
-mod event_handler {
+pub(crate) mod event_handler {
     use domain::Request;
 
     pub(crate) struct WorkerHandle<C, E>
@@ -34,14 +34,13 @@ mod event_handler {
             self.tx.send(envelope).await
         }
     }
-
     pub struct Envelope<R: Request, E> {
         pub req: R,
         pub reply_to: tokio::sync::oneshot::Sender<Result<R::Response, E>>,
     }
 }
 
-mod inventory_worker {
+pub mod inventory_worker {
 
     use domain::{
         Request,
@@ -49,7 +48,7 @@ mod inventory_worker {
         tools::{id::Id, snapshot::Snapshot},
     };
     use persistance::PineappleDatabase;
-    use tokio::task::JoinHandle;
+    use tokio::{sync::OnceCell, task::JoinHandle};
 
     use crate::handlers::event_handler::{Envelope, WorkerHandle};
 
