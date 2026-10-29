@@ -84,19 +84,87 @@ async fn invalid_stock_states_are_rejected() {
     for sql in [
         "INSERT INTO items VALUES ('duplicate', 'SKU', 'Duplicate', NULL)",
         "INSERT INTO items VALUES ('empty', ' ', 'Example', NULL)",
-        "INSERT INTO stocks VALUES ('missing', 'bulk', 0, 0)",
-        "INSERT INTO stocks VALUES ('item', 'bulk', -1, 0)",
-        "INSERT INTO stocks VALUES ('item', 'bulk', NULL, 0)",
-        "INSERT INTO stocks VALUES ('item', 'individual', 1, 0)",
-        "INSERT INTO stocks VALUES ('item', 'bulk', 1, -1)",
-        "INSERT INTO stocks VALUES ('item', 'unknown', 1, 0)",
+        "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('missing', 'bulk', 0, 0)",
+        "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('item', 'bulk', -1, 0)",
+        "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('item', 'bulk', NULL, 0)",
+        "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('item', 'individual', 1, 0)",
+        "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('item', 'bulk', 1, -1)",
+        "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('item', 'unknown', 1, 0)",
     ] {
         rejects(&pool, sql).await;
     }
-    execute(&pool, "INSERT INTO stocks VALUES ('item', 'bulk', 0, 0)").await;
+    execute(&pool, "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('item', 'bulk', 0, 0)").await;
     rejects(
         &pool,
-        "INSERT INTO stocks VALUES ('item', 'individual', NULL, 0)",
+        "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('item', 'individual', NULL, 0)",
     )
     .await;
+}
+
+#[tokio::test]
+async fn measured_migration_preserves_populated_legacy_database_and_foreign_keys() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let legacy = Migrator::with_migrations(MIGRATOR.iter().take(1).cloned().collect());
+    legacy.run(&pool).await.unwrap();
+    execute(&pool, "INSERT INTO items VALUES ('bulk', 'BULK', 'Bulk', NULL), ('individual', 'INDIVIDUAL', 'Individual', NULL)").await;
+    execute(&pool, "INSERT INTO stocks VALUES ('bulk', 'bulk', 9007199254740993, 12), ('individual', 'individual', NULL, 2)").await;
+    execute(&pool, "INSERT INTO stock_units (id, item_id, serial_number) VALUES ('unit', 'individual', 'SERIAL')").await;
+    MIGRATOR.run(&pool).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT quantity FROM stocks WHERE item_id = 'bulk'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        9_007_199_254_740_993
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT serial_number FROM stock_units WHERE id = 'unit'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "SERIAL"
+    );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    rejects(&pool, "DELETE FROM stocks WHERE item_id = 'individual'").await;
+    rejects(
+        &pool,
+        "INSERT INTO stock_units (id, item_id) VALUES ('bad-unit', 'bulk')",
+    )
+    .await;
+    rejects(&pool, "INSERT INTO stock_units (id, item_id, serial_number) VALUES ('duplicate', 'individual', 'SERIAL')").await;
+}
+
+#[tokio::test]
+async fn mass_storage_rejects_mixed_measurements_zero_piece_weight_and_infinity() {
+    let pool = database().await;
+    execute(
+        &pool,
+        "INSERT INTO items VALUES ('mass', 'MASS', 'Mass stock', NULL)",
+    )
+    .await;
+    execute(&pool, "INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at, measurement, quantity_grams, low_stock_at_grams, mass_per_piece) VALUES ('mass', 'bulk', NULL, NULL, 'mass', 1000.5, 100.0, 2.5)").await;
+    for sql in [
+        "UPDATE stocks SET quantity = 1 WHERE item_id = 'mass'",
+        "UPDATE stocks SET low_stock_at = 1 WHERE item_id = 'mass'",
+        "UPDATE stocks SET quantity_grams = NULL WHERE item_id = 'mass'",
+        "UPDATE stocks SET low_stock_at_grams = NULL WHERE item_id = 'mass'",
+        "UPDATE stocks SET mass_per_piece = 0 WHERE item_id = 'mass'",
+        "UPDATE stocks SET quantity_grams = -1 WHERE item_id = 'mass'",
+        "UPDATE stocks SET quantity_grams = 1e999 WHERE item_id = 'mass'",
+        "UPDATE stocks SET mass_per_piece = 1e999 WHERE item_id = 'mass'",
+        "UPDATE stocks SET tracking_mode = 'individual' WHERE item_id = 'mass'",
+    ] {
+        rejects(&pool, sql).await;
+    }
 }

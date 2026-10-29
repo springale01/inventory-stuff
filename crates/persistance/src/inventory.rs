@@ -1,8 +1,14 @@
 //! Inventory queries. Counts are limited to SQLite's signed 64-bit range.
 use domain::{
-    models::sku::Sku,
-    models::stock::{Item, StockUnit},
-    tools::id::Id,
+    models::{
+        movement::{AddCmd, MovementEvent, MovementKind, RemoveCmd},
+        sku::Sku,
+        stock::{Item, Stock, StockAmount, StockError, StockUnit},
+    },
+    tools::{
+        id::Id,
+        units::{Grams, Quantity},
+    },
 };
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
 use uuid::Uuid;
@@ -28,14 +34,28 @@ impl TrackingMode {
 pub struct StockSummary {
     pub item: Item,
     pub tracking_mode: TrackingMode,
-    pub quantity: u64,
-    pub low_stock_at: u64,
+    pub quantity: StockAmount,
+    pub low_stock_at: StockAmount,
 }
 
 impl StockSummary {
     pub fn is_low(&self) -> bool {
-        self.quantity <= self.low_stock_at
+        match (self.quantity, self.low_stock_at) {
+            (StockAmount::Count(a), StockAmount::Count(b)) => a <= b,
+            (StockAmount::Mass { quantity: a, .. }, StockAmount::Mass { quantity: b, .. }) => {
+                a.value() <= b.value()
+            }
+            _ => false,
+        }
     }
+}
+
+/// Stock and individual units read from one database transaction.
+#[derive(Debug)]
+pub struct InventoryState {
+    pub stock: Stock,
+    /// `None` for bulk tracking; `Some([])` for empty individually tracked stock.
+    pub units: Option<Box<[StockUnit]>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,8 +66,8 @@ pub enum InventoryError {
     NotFound(&'static str),
     #[error("Operation does not match the item's stock tracking mode")]
     WrongTrackingMode,
-    #[error("Insufficient stock: available {available}, requested {requested}")]
-    InsufficientStock { available: u64, requested: u64 },
+    #[error(transparent)]
+    Stock(#[from] StockError),
     #[error("Quantity exceeds SQLite's supported range")]
     QuantityOverflow,
     #[error("Remove all stock before deleting the item")]
@@ -97,15 +117,33 @@ fn summary(row: &SqliteRow) -> Result<StockSummary, InventoryError> {
             )));
         }
     };
-    let quantity: i64 = row.try_get("quantity")?;
-    let threshold: i64 = row.try_get("low_stock_at")?;
+    let measurement: String = row.try_get("measurement")?;
+    let quantity = decode_amount(
+        row,
+        &measurement,
+        "quantity",
+        "quantity_grams",
+        "mass_per_piece",
+    )?;
+    let low_stock_at = decode_amount(
+        row,
+        &measurement,
+        "low_stock_at",
+        "low_stock_at_grams",
+        "mass_per_piece",
+    )?;
+    Stock::new(id(row, "id")?, quantity, low_stock_at)
+        .map_err(|e| InventoryError::InvalidData(e.to_string()))?;
+    if tracking_mode == TrackingMode::Individual && measurement != "count" {
+        return Err(InventoryError::InvalidData(
+            "individual stock must use counts".into(),
+        ));
+    }
     Ok(StockSummary {
         item: item(row)?,
         tracking_mode,
-        quantity: u64::try_from(quantity)
-            .map_err(|_| InventoryError::InvalidData("negative quantity".into()))?,
-        low_stock_at: u64::try_from(threshold)
-            .map_err(|_| InventoryError::InvalidData("negative threshold".into()))?,
+        quantity,
+        low_stock_at,
     })
 }
 
@@ -114,12 +152,173 @@ macro_rules! stock_select {
     ($suffix:literal) => {
         concat!(
             "SELECT i.id, i.sku, i.name, i.description, s.tracking_mode,
-    s.low_stock_at, CASE WHEN s.tracking_mode = 'bulk' THEN s.quantity
+    s.low_stock_at, s.measurement, s.quantity_grams, s.low_stock_at_grams, s.mass_per_piece,
+    CASE WHEN s.tracking_mode = 'bulk' THEN s.quantity
     ELSE (SELECT count(*) FROM stock_units u WHERE u.item_id = i.id) END AS quantity
     FROM items i JOIN stocks s ON s.item_id = i.id ",
             $suffix
         )
     };
+}
+
+fn measurement(amount: StockAmount) -> &'static str {
+    match amount {
+        StockAmount::Count(_) => "count",
+        StockAmount::Mass { .. } => "mass",
+    }
+}
+
+// Separate INTEGER and REAL columns keep large piece counts exact.
+type AmountColumns = (Option<i64>, Option<f64>, Option<f64>);
+
+fn encode_amount(amount: StockAmount) -> Result<AmountColumns, InventoryError> {
+    match amount {
+        StockAmount::Count(count) => Ok((Some(integer(count)?), None, None)),
+        StockAmount::Mass {
+            quantity,
+            mass_per_piece,
+        } => {
+            if mass_per_piece.is_some_and(|value| value.value() == 0.0) {
+                return Err(StockError::ZeroMassPerPiece.into());
+            }
+            Ok((
+                None,
+                Some(quantity.value()),
+                mass_per_piece.map(Quantity::value),
+            ))
+        }
+    }
+}
+
+fn decode_amount(
+    row: &SqliteRow,
+    measurement: &str,
+    count: &str,
+    grams: &str,
+    piece: &str,
+) -> Result<StockAmount, InventoryError> {
+    let invalid = InventoryError::InvalidData;
+    match measurement {
+        "count" => {
+            let value: Option<i64> = row.try_get(count)?;
+            let value = value.ok_or_else(|| invalid(format!("missing {count}")))?;
+            Ok(StockAmount::Count(
+                u64::try_from(value).map_err(|_| invalid(format!("negative {count}")))?,
+            ))
+        }
+        "mass" => {
+            let value: Option<f64> = row.try_get(grams)?;
+            let value = value.ok_or_else(|| invalid(format!("missing {grams}")))?;
+            let piece: Option<f64> = row.try_get(piece)?;
+            let quantity = Quantity::<Grams>::new(value).map_err(|e| invalid(e.to_string()))?;
+            let mass_per_piece = piece
+                .map(Quantity::<Grams>::new)
+                .transpose()
+                .map_err(|e| invalid(e.to_string()))?;
+            if mass_per_piece.is_some_and(|value| value.value() == 0.0) {
+                return Err(invalid("zero mass per piece".into()));
+            }
+            Ok(StockAmount::Mass {
+                quantity,
+                mass_per_piece,
+            })
+        }
+        _ => Err(invalid(format!("unknown measurement: {measurement}"))),
+    }
+}
+
+async fn load_summary(
+    connection: &mut SqliteConnection,
+    item_id: Id<Item>,
+) -> Result<StockSummary, InventoryError> {
+    let row = sqlx::query(stock_select!("WHERE i.id = ?"))
+        .bind(item_id.id().to_string())
+        .fetch_optional(connection)
+        .await?
+        .ok_or(InventoryError::NotFound("stock"))?;
+    summary(&row)
+}
+
+async fn write_balance(
+    connection: &mut SqliteConnection,
+    stock: &Stock,
+) -> Result<(), InventoryError> {
+    let (count, grams, _) = encode_amount(stock.quantity())?;
+    sqlx::query("UPDATE stocks SET quantity = ?, quantity_grams = ? WHERE item_id = ?")
+        .bind(count)
+        .bind(grams)
+        .bind(stock.item_id().id().to_string())
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+async fn save_movement(
+    connection: &mut SqliteConnection,
+    event: &MovementEvent,
+) -> Result<(), InventoryError> {
+    let (amount_count, amount_grams, amount_piece) = encode_amount(event.amount)?;
+    let (before_count, before_grams, before_piece) = encode_amount(event.quantity_before)?;
+    let (after_count, after_grams, after_piece) = encode_amount(event.quantity_after)?;
+    let kind = match event.kind {
+        MovementKind::Added => "added",
+        MovementKind::Removed => "removed",
+    };
+    sqlx::query("INSERT INTO stock_movements (id, item_id, kind, measurement, amount_count, before_count, after_count, amount_grams, before_grams, after_grams, amount_mass_per_piece, before_mass_per_piece, after_mass_per_piece, reason, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(event.id.id().to_string()).bind(event.item_id.id().to_string())
+        .bind(kind).bind(measurement(event.amount))
+        .bind(amount_count).bind(before_count).bind(after_count)
+        .bind(amount_grams).bind(before_grams).bind(after_grams)
+        .bind(amount_piece).bind(before_piece).bind(after_piece)
+        .bind(&*event.reason).bind(event.occurred_at.to_rfc3339())
+        .execute(connection).await?;
+    Ok(())
+}
+
+fn movement(row: &SqliteRow) -> Result<MovementEvent, InventoryError> {
+    let kind: String = row.try_get("kind")?;
+    let kind = match kind.as_str() {
+        "added" => MovementKind::Added,
+        "removed" => MovementKind::Removed,
+        _ => {
+            return Err(InventoryError::InvalidData(format!(
+                "unknown movement kind: {kind}"
+            )));
+        }
+    };
+    let measurement: String = row.try_get("measurement")?;
+    let occurred_at: String = row.try_get("occurred_at")?;
+    let reason: String = row.try_get("reason")?;
+    Ok(MovementEvent {
+        id: id(row, "id")?,
+        item_id: id(row, "item_id")?,
+        kind,
+        amount: decode_amount(
+            row,
+            &measurement,
+            "amount_count",
+            "amount_grams",
+            "amount_mass_per_piece",
+        )?,
+        quantity_before: decode_amount(
+            row,
+            &measurement,
+            "before_count",
+            "before_grams",
+            "before_mass_per_piece",
+        )?,
+        quantity_after: decode_amount(
+            row,
+            &measurement,
+            "after_count",
+            "after_grams",
+            "after_mass_per_piece",
+        )?,
+        reason: reason.into_boxed_str(),
+        occurred_at: chrono::DateTime::parse_from_rfc3339(&occurred_at)
+            .map_err(|e| InventoryError::InvalidData(e.to_string()))?
+            .with_timezone(&chrono::Utc),
+    })
 }
 
 impl PineappleDatabase {
@@ -128,12 +327,25 @@ impl PineappleDatabase {
         &self,
         value: &Item,
         mode: TrackingMode,
-        low_stock_at: u64,
+        low_stock_at: impl Into<StockAmount>,
     ) -> Result<(), InventoryError> {
         if value.name.trim().is_empty() {
             return Err(InventoryError::InvalidInput("item name must not be blank"));
         }
-        let threshold = integer(low_stock_at)?;
+        let threshold = low_stock_at.into();
+        let zero = match threshold {
+            StockAmount::Count(_) => StockAmount::Count(0),
+            StockAmount::Mass { mass_per_piece, .. } => StockAmount::Mass {
+                quantity: Quantity::new(0.0).expect("zero is valid"),
+                mass_per_piece,
+            },
+        };
+        Stock::new(value.id, zero, threshold)?;
+        if mode == TrackingMode::Individual && matches!(threshold, StockAmount::Mass { .. }) {
+            return Err(InventoryError::WrongTrackingMode);
+        }
+        let (count, grams, piece) = encode_amount(zero)?;
+        let (threshold_count, threshold_grams, _) = encode_amount(threshold)?;
         let mut tx = self.pool().begin().await?;
         sqlx::query("INSERT INTO items (id, sku, name, description) VALUES (?, ?, ?, ?)")
             .bind(value.id.id().to_string())
@@ -142,9 +354,10 @@ impl PineappleDatabase {
             .bind(&value.description)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES (?, ?, ?, ?)")
+        sqlx::query("INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at, measurement, quantity_grams, low_stock_at_grams, mass_per_piece) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(value.id.id().to_string()).bind(mode.as_str())
-            .bind(if mode == TrackingMode::Bulk { Some(0_i64) } else { None }).bind(threshold)
+            .bind(if mode == TrackingMode::Bulk { count } else { None }).bind(threshold_count)
+            .bind(measurement(zero)).bind(grams).bind(threshold_grams).bind(piece)
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
@@ -273,7 +486,7 @@ impl PineappleDatabase {
         limit: u32,
         offset: u64,
     ) -> Result<Vec<StockSummary>, InventoryError> {
-        sqlx::query(stock_select!("WHERE (? = 0 OR (CASE WHEN s.tracking_mode = 'bulk' THEN s.quantity ELSE (SELECT count(*) FROM stock_units u WHERE u.item_id = i.id) END) <= s.low_stock_at) ORDER BY i.sku, i.id LIMIT ? OFFSET ?"))
+        sqlx::query(stock_select!("WHERE (? = 0 OR (CASE WHEN s.measurement = 'mass' THEN s.quantity_grams <= s.low_stock_at_grams ELSE (CASE WHEN s.tracking_mode = 'bulk' THEN s.quantity ELSE (SELECT count(*) FROM stock_units u WHERE u.item_id = i.id) END) <= s.low_stock_at END)) ORDER BY i.sku, i.id LIMIT ? OFFSET ?"))
             .bind(low_only).bind(i64::from(limit)).bind(integer(offset)?)
             .fetch_all(self.pool()).await?.iter().map(summary).collect()
     }
@@ -281,71 +494,17 @@ impl PineappleDatabase {
     pub async fn set_low_stock_at(
         &self,
         item_id: Id<Item>,
-        threshold: u64,
+        threshold: impl Into<StockAmount>,
     ) -> Result<(), InventoryError> {
-        let result = sqlx::query("UPDATE stocks SET low_stock_at = ? WHERE item_id = ?")
-            .bind(integer(threshold)?)
-            .bind(item_id.id().to_string())
-            .execute(self.pool())
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(InventoryError::NotFound("stock"));
-        }
-        Ok(())
-    }
-
-    pub async fn receive_bulk(&self, item_id: Id<Item>, amount: u64) -> Result<(), InventoryError> {
-        self.change_bulk(item_id, amount, BulkChange::Receive).await
-    }
-
-    pub async fn remove_bulk(&self, item_id: Id<Item>, amount: u64) -> Result<(), InventoryError> {
-        self.change_bulk(item_id, amount, BulkChange::Remove).await
-    }
-
-    /// Absolute correction; zero is allowed. No movement audit is recorded yet.
-    pub async fn set_bulk_quantity(
-        &self,
-        item_id: Id<Item>,
-        quantity: u64,
-    ) -> Result<(), InventoryError> {
-        self.change_bulk(item_id, quantity, BulkChange::Set).await
-    }
-
-    async fn change_bulk(
-        &self,
-        item_id: Id<Item>,
-        value: u64,
-        change: BulkChange,
-    ) -> Result<(), InventoryError> {
-        if value == 0 && !matches!(change, BulkChange::Set) {
-            return Err(InventoryError::InvalidInput(
-                "adjustment must be greater than zero",
-            ));
-        }
-        let value_i64 = integer(value)?;
+        let threshold = threshold.into();
         let mut tx = self.pool().begin().await?;
-        // Write first to acquire SQLite's writer lock before reading stock.
-        // All arithmetic happens under that lock, preventing lost updates.
-        let (mode, available) = lock_stock(&mut tx, item_id).await?;
-        if mode != "bulk" {
-            return Err(InventoryError::WrongTrackingMode);
-        }
-        let available = available
-            .ok_or_else(|| InventoryError::InvalidData("bulk stock has no quantity".into()))?;
-        let next = match change {
-            BulkChange::Receive => available
-                .checked_add(value_i64)
-                .ok_or(InventoryError::QuantityOverflow)?,
-            BulkChange::Remove => available.checked_sub(value_i64).filter(|v| *v >= 0).ok_or(
-                InventoryError::InsufficientStock {
-                    available: available as u64,
-                    requested: value,
-                },
-            )?,
-            BulkChange::Set => value_i64,
-        };
-        sqlx::query("UPDATE stocks SET quantity = ? WHERE item_id = ?")
-            .bind(next)
+        lock_stock(&mut tx, item_id).await?;
+        let current = load_summary(&mut tx, item_id).await?;
+        Stock::new(item_id, current.quantity, threshold)?;
+        let (count, grams, _) = encode_amount(threshold)?;
+        sqlx::query("UPDATE stocks SET low_stock_at = ?, low_stock_at_grams = ? WHERE item_id = ?")
+            .bind(count)
+            .bind(grams)
             .bind(item_id.id().to_string())
             .execute(&mut *tx)
             .await?;
@@ -353,6 +512,150 @@ impl PineappleDatabase {
         Ok(())
     }
 
+    /// A consistent view for the inventory worker's Get response.
+    pub async fn get_inventory(
+        &self,
+        item_id: Id<Item>,
+    ) -> Result<Option<InventoryState>, InventoryError> {
+        let mut tx = self.pool().begin().await?;
+        let row = sqlx::query(stock_select!("WHERE i.id = ?"))
+            .bind(item_id.id().to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let value = summary(&row)?;
+        let stock = Stock::new(item_id, value.quantity, value.low_stock_at)?;
+        let units = if value.tracking_mode == TrackingMode::Individual {
+            Some(
+                sqlx::query(
+                    "SELECT id, serial_number FROM stock_units WHERE item_id = ? ORDER BY id",
+                )
+                .bind(item_id.id().to_string())
+                .fetch_all(&mut *tx)
+                .await?
+                .iter()
+                .map(unit)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice(),
+            )
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(Some(InventoryState { stock, units }))
+    }
+
+    /// Applies domain validation and commits the balance and event together.
+    /// Individually tracked stock requires explicit unit selection instead.
+    pub async fn add_stock(
+        &self,
+        item_id: Id<Item>,
+        amount: impl Into<StockAmount>,
+        reason: impl Into<Box<str>>,
+    ) -> Result<MovementEvent, InventoryError> {
+        let command = AddCmd::new(item_id, amount, reason)?;
+        self.change_stock(item_id, |stock| command.execute(stock))
+            .await
+    }
+
+    pub async fn remove_stock(
+        &self,
+        item_id: Id<Item>,
+        amount: impl Into<StockAmount>,
+        reason: impl Into<Box<str>>,
+    ) -> Result<MovementEvent, InventoryError> {
+        let command = RemoveCmd::new(item_id, amount, reason)?;
+        self.change_stock(item_id, |stock| command.execute(stock))
+            .await
+    }
+
+    async fn change_stock(
+        &self,
+        item_id: Id<Item>,
+        apply: impl FnOnce(&mut Stock) -> Result<MovementEvent, StockError>,
+    ) -> Result<MovementEvent, InventoryError> {
+        let mut tx = self.pool().begin().await?;
+        // Acquire the writer lock before reading: separate workers cannot lose updates.
+        lock_stock(&mut tx, item_id).await?;
+        let value = load_summary(&mut tx, item_id).await?;
+        if value.tracking_mode != TrackingMode::Bulk {
+            return Err(InventoryError::WrongTrackingMode);
+        }
+        let mut stock = Stock::new(item_id, value.quantity, value.low_stock_at)?;
+        let event = apply(&mut stock)?;
+        write_balance(&mut tx, &stock).await?;
+        save_movement(&mut tx, &event).await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
+    /// Compatibility helpers for count-only callers; new callers should supply a reason.
+    pub async fn receive_bulk(&self, item_id: Id<Item>, amount: u64) -> Result<(), InventoryError> {
+        self.add_stock(item_id, amount, "Bulk receipt")
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn remove_bulk(&self, item_id: Id<Item>, amount: u64) -> Result<(), InventoryError> {
+        self.remove_stock(item_id, amount, "Bulk removal")
+            .await
+            .map(|_| ())
+    }
+
+    /// Absolute count correction. Any actual change is recorded as a movement.
+    pub async fn set_bulk_quantity(
+        &self,
+        item_id: Id<Item>,
+        quantity: u64,
+    ) -> Result<(), InventoryError> {
+        integer(quantity)?;
+        let mut tx = self.pool().begin().await?;
+        lock_stock(&mut tx, item_id).await?;
+        let current = load_summary(&mut tx, item_id).await?;
+        if current.tracking_mode != TrackingMode::Bulk {
+            return Err(InventoryError::WrongTrackingMode);
+        }
+        let StockAmount::Count(before) = current.quantity else {
+            return Err(StockError::MeasurementMismatch.into());
+        };
+        let mut stock = Stock::new(item_id, current.quantity, current.low_stock_at)?;
+        let event = if quantity > before {
+            Some(AddCmd::new(item_id, quantity - before, "Count correction")?.execute(&mut stock)?)
+        } else if quantity < before {
+            Some(
+                RemoveCmd::new(item_id, before - quantity, "Count correction")?
+                    .execute(&mut stock)?,
+            )
+        } else {
+            None
+        };
+        if let Some(event) = event {
+            write_balance(&mut tx, &stock).await?;
+            save_movement(&mut tx, &event).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// History is ordered by event ID, with stable offset pagination.
+    pub async fn list_movements(
+        &self,
+        item_id: Id<Item>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<MovementEvent>, InventoryError> {
+        sqlx::query("SELECT * FROM stock_movements WHERE item_id = ? ORDER BY id LIMIT ? OFFSET ?")
+            .bind(item_id.id().to_string())
+            .bind(i64::from(limit))
+            .bind(integer(offset)?)
+            .fetch_all(self.pool())
+            .await?
+            .iter()
+            .map(movement)
+            .collect()
+    }
     /// Inserts all units or none. Serial numbers are unique per item when present.
     pub async fn receive_units(
         &self,
@@ -376,10 +679,14 @@ impl PineappleDatabase {
             }
         }
         let mut tx = self.pool().begin().await?;
-        let (mode, _) = lock_stock(&mut tx, item_id).await?;
+        let mode = lock_stock(&mut tx, item_id).await?;
         if mode != "individual" {
             return Err(InventoryError::WrongTrackingMode);
         }
+        let current = load_summary(&mut tx, item_id).await?;
+        let mut stock = Stock::new(item_id, current.quantity, current.low_stock_at)?;
+        let amount = u64::try_from(units.len()).map_err(|_| InventoryError::QuantityOverflow)?;
+        let event = AddCmd::new(item_id, amount, "Individual unit receipt")?.execute(&mut stock)?;
         for unit in units {
             sqlx::query("INSERT INTO stock_units (id, item_id, serial_number) VALUES (?, ?, ?)")
                 .bind(unit.id.id().to_string())
@@ -388,6 +695,7 @@ impl PineappleDatabase {
                 .execute(&mut *tx)
                 .await?;
         }
+        save_movement(&mut tx, &event).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -425,10 +733,12 @@ impl PineappleDatabase {
         unit_id: Id<StockUnit>,
     ) -> Result<StockUnit, InventoryError> {
         let mut tx = self.pool().begin().await?;
-        let (mode, _) = lock_stock(&mut tx, item_id).await?;
+        let mode = lock_stock(&mut tx, item_id).await?;
         if mode != "individual" {
             return Err(InventoryError::WrongTrackingMode);
         }
+        let current = load_summary(&mut tx, item_id).await?;
+        let mut stock = Stock::new(item_id, current.quantity, current.low_stock_at)?;
         let row = sqlx::query(
             "DELETE FROM stock_units WHERE item_id = ? AND id = ? RETURNING id, serial_number",
         )
@@ -438,6 +748,9 @@ impl PineappleDatabase {
         .await?
         .ok_or(InventoryError::NotFound("stock unit"))?;
         let removed = unit(&row)?;
+        let event =
+            RemoveCmd::new(item_id, 1_u64, "Individual unit removal")?.execute(&mut stock)?;
+        save_movement(&mut tx, &event).await?;
         tx.commit().await?;
         Ok(removed)
     }
@@ -445,12 +758,13 @@ impl PineappleDatabase {
     /// Refuses deletion while bulk quantity or individual units remain.
     pub async fn delete_item(&self, item_id: Id<Item>) -> Result<(), InventoryError> {
         let mut tx = self.pool().begin().await?;
-        let (_, quantity) = lock_stock(&mut tx, item_id).await?;
+        lock_stock(&mut tx, item_id).await?;
+        let current = load_summary(&mut tx, item_id).await?;
         let units: i64 = sqlx::query_scalar("SELECT count(*) FROM stock_units WHERE item_id = ?")
             .bind(item_id.id().to_string())
             .fetch_one(&mut *tx)
             .await?;
-        if quantity.unwrap_or(0) != 0 || units != 0 {
+        if !current.quantity.is_zero() || units != 0 {
             return Err(InventoryError::StockNotEmpty);
         }
         sqlx::query("DELETE FROM stocks WHERE item_id = ?")
@@ -466,18 +780,16 @@ impl PineappleDatabase {
     }
 }
 
-enum BulkChange {
-    Receive,
-    Remove,
-    Set,
-}
-
 async fn lock_stock(
     connection: &mut SqliteConnection,
     item_id: Id<Item>,
-) -> Result<(String, Option<i64>), InventoryError> {
-    let row = sqlx::query("UPDATE stocks SET low_stock_at = low_stock_at WHERE item_id = ? RETURNING tracking_mode, quantity")
-        .bind(item_id.id().to_string()).fetch_optional(connection).await?
-        .ok_or(InventoryError::NotFound("stock"))?;
-    Ok((row.try_get("tracking_mode")?, row.try_get("quantity")?))
+) -> Result<String, InventoryError> {
+    let mode = sqlx::query_scalar(
+        "UPDATE stocks SET low_stock_at = low_stock_at WHERE item_id = ? RETURNING tracking_mode",
+    )
+    .bind(item_id.id().to_string())
+    .fetch_optional(connection)
+    .await?
+    .ok_or(InventoryError::NotFound("stock"))?;
+    Ok(mode)
 }

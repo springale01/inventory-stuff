@@ -91,6 +91,7 @@ impl Request for RemoveCmd {
 
 // Share validation without a macro so both public command types stay easy to read.
 fn validate_input(amount: StockAmount, reason: &str) -> Result<(), StockError> {
+    amount.validate()?;
     if amount.is_zero() {
         return Err(StockError::ZeroQuantityAdjustment);
     }

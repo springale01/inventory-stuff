@@ -26,7 +26,7 @@ async fn startup_creates_migrates_and_reopens_a_database() {
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("INSERT INTO stocks VALUES ('item', 'bulk', 10, 2)")
+    sqlx::query("INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('item', 'bulk', 10, 2)")
         .execute(db.pool())
         .await
         .unwrap();
@@ -51,7 +51,7 @@ async fn startup_creates_migrates_and_reopens_a_database() {
             .fetch_one(reopened.pool())
             .await
             .unwrap();
-    assert_eq!(migrations, 1);
+    assert_eq!(migrations, 2);
     let shared = reopened.clone();
     reopened.close().await;
     assert!(shared.pool().is_closed());
@@ -77,7 +77,7 @@ async fn memory_database_shares_schema_and_enforces_foreign_keys_on_each_connect
             .await
             .unwrap();
         assert_eq!(count, 0);
-        let error = sqlx::query("INSERT INTO stocks VALUES ('missing', 'bulk', 0, 0)")
+        let error = sqlx::query("INSERT INTO stocks (item_id, tracking_mode, quantity, low_stock_at) VALUES ('missing', 'bulk', 0, 0)")
             .execute(&mut **connection)
             .await
             .unwrap_err();

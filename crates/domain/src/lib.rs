@@ -2,11 +2,12 @@ use std::pin::Pin;
 
 pub mod models;
 pub mod tools;
+/// Abstractions for later
 
 pub trait Request {
     type Response: Send;
 }
-
+/// Abstraction for later
 pub trait Handle<T>
 where
     T: Request,
@@ -18,5 +19,5 @@ where
         &self,
         ctx: Self::Context,
         req: T,
-    ) -> Pin<Box<dyn Future<Output = Result<T::Response, Self::Error>>>>;
+    ) -> Pin<Box<dyn Future<Output = Result<T::Response, Self::Error>> + Send>>;
 }

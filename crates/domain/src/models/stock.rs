@@ -32,29 +32,65 @@ pub struct StockUnit {
 
 /// A nonnegative balance or adjustment in whole pieces or grams.
 ///
-/// Stock keeps one measurement, even at zero. Estimates are excluded: turning an
-/// estimated count into a deduction needs an explicit business rule. Convert
+/// Stock keeps one measurement, even at zero. Estimated piece counts do not
+/// change the balance: turning an estimate into a deduction needs an explicit
+/// business rule. Convert
 /// kilograms to grams before constructing mass. Mass arithmetic remains approximate
 /// because `Quantity` uses `f64`; integer counts stay exact.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StockAmount {
     Count(u64),
-    Mass(Quantity<Grams>),
+    Mass {
+        quantity: Quantity<Grams>,
+        /// Average piece weight, strictly positive when present. Movements
+        /// preserve the balance's piece weight and change only total mass.
+        mass_per_piece: Option<Quantity<Grams>>,
+    },
 }
 
 impl StockAmount {
+    /// Estimates pieces from total mass / average piece weight, without rounding.
+    /// Returns `None` for counts (which are already exact) or unknown piece weight.
+    /// An invalid piece weight or nonfinite estimate returns an error.
+    pub fn estimated_piece_count(self) -> Result<Option<f64>, StockError> {
+        self.validate()?;
+        match self {
+            Self::Mass {
+                quantity,
+                mass_per_piece: Some(piece_mass),
+            } => {
+                let estimate = quantity.value() / piece_mass.value();
+                if !estimate.is_finite() {
+                    return Err(QuantityError::Overflow.into());
+                }
+                if quantity.value() > 0.0 && estimate == 0.0 {
+                    return Err(QuantityError::Underflow.into());
+                }
+                Ok(Some(estimate))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) fn validate(self) -> Result<(), StockError> {
+        if matches!(self, Self::Mass { mass_per_piece: Some(value), .. } if value.value() == 0.0) {
+            return Err(StockError::ZeroMassPerPiece);
+        }
+        Ok(())
+    }
+
     /// Zero is valid for balances and thresholds, but not for movement commands.
     pub fn is_zero(self) -> bool {
         match self {
             Self::Count(value) => value == 0,
-            Self::Mass(value) => value.value() == 0.0,
+            Self::Mass { quantity, .. } => quantity.value() == 0.0,
         }
     }
 
     fn same_measurement(self, other: Self) -> bool {
         matches!(
             (self, other),
-            (Self::Count(_), Self::Count(_)) | (Self::Mass(_), Self::Mass(_))
+            (Self::Count(_), Self::Count(_)) | (Self::Mass { .. }, Self::Mass { .. })
         )
     }
 
@@ -64,7 +100,16 @@ impl StockAmount {
                 .checked_add(b)
                 .map(Self::Count)
                 .ok_or(StockError::Overflow),
-            (Self::Mass(a), Self::Mass(b)) => Ok(Self::Mass(a.checked_add(b)?)),
+            (
+                Self::Mass {
+                    quantity: a,
+                    mass_per_piece,
+                },
+                Self::Mass { quantity: b, .. },
+            ) => Ok(Self::Mass {
+                quantity: a.checked_add(b)?,
+                mass_per_piece,
+            }),
             _ => Err(StockError::MeasurementMismatch),
         }
     }
@@ -73,7 +118,9 @@ impl StockAmount {
         // Never convert counts to f64: large integers would lose precision.
         let insufficient = match (self, amount) {
             (Self::Count(a), Self::Count(b)) => b > a,
-            (Self::Mass(a), Self::Mass(b)) => b.value() > a.value(),
+            (Self::Mass { quantity: a, .. }, Self::Mass { quantity: b, .. }) => {
+                b.value() > a.value()
+            }
             _ => return Err(StockError::MeasurementMismatch),
         };
         if insufficient {
@@ -84,7 +131,16 @@ impl StockAmount {
         }
         match (self, amount) {
             (Self::Count(a), Self::Count(b)) => Ok(Self::Count(a - b)),
-            (Self::Mass(a), Self::Mass(b)) => Ok(Self::Mass(a.checked_sub(b)?)),
+            (
+                Self::Mass {
+                    quantity: a,
+                    mass_per_piece,
+                },
+                Self::Mass { quantity: b, .. },
+            ) => Ok(Self::Mass {
+                quantity: a.checked_sub(b)?,
+                mass_per_piece,
+            }),
             _ => unreachable!("measurements were checked above"),
         }
     }
@@ -98,7 +154,10 @@ impl From<u64> for StockAmount {
 
 impl From<Quantity<Grams>> for StockAmount {
     fn from(value: Quantity<Grams>) -> Self {
-        Self::Mass(value)
+        Self::Mass {
+            quantity: value,
+            mass_per_piece: None,
+        }
     }
 }
 
@@ -106,7 +165,7 @@ impl std::fmt::Display for StockAmount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Count(value) => write!(f, "{value} pieces"),
-            Self::Mass(value) => value.fmt(f),
+            Self::Mass { quantity, .. } => quantity.fmt(f),
         }
     }
 }
@@ -115,7 +174,7 @@ impl std::fmt::Display for StockAmount {
 ///
 /// Private fields prevent bypassing validation. This is an in-memory balance;
 /// coordinating multiple database writers belongs in the persistence layer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Stock {
     item_id: Id<Item>,
     quantity: StockAmount,
@@ -125,6 +184,8 @@ pub struct Stock {
 /// A rejected domain operation leaves the original balance unchanged.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum StockError {
+    #[error("mass per piece must be positive")]
+    ZeroMassPerPiece,
     #[error("stock movements must have a positive amount")]
     ZeroQuantityAdjustment,
     #[error("movement reason must not be blank")]
@@ -156,6 +217,8 @@ impl Stock {
     ) -> Result<Self, StockError> {
         let quantity = quantity.into();
         let low_stock_at = low_stock_at.into();
+        quantity.validate()?;
+        low_stock_at.validate()?;
         if !quantity.same_measurement(low_stock_at) {
             return Err(StockError::MeasurementMismatch);
         }
@@ -185,7 +248,9 @@ impl Stock {
     pub fn is_low(&self) -> bool {
         match (self.quantity, self.low_stock_at) {
             (StockAmount::Count(a), StockAmount::Count(b)) => a <= b,
-            (StockAmount::Mass(a), StockAmount::Mass(b)) => a.value() <= b.value(),
+            (StockAmount::Mass { quantity: a, .. }, StockAmount::Mass { quantity: b, .. }) => {
+                a.value() <= b.value()
+            }
             _ => unreachable!("constructor guarantees matching measurements"),
         }
     }

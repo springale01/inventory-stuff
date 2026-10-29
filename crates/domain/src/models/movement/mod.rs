@@ -12,8 +12,8 @@
 //! let event = RemoveCmd::new(item_id, grams(250.0)?, "Sold by weight")?
 //!     .execute(&mut stock)?;
 //! assert_eq!(event.kind, MovementKind::Removed);
-//! assert_eq!(event.quantity_before, StockAmount::Mass(grams(1_000.0)?));
-//! assert_eq!(stock.quantity(), StockAmount::Mass(grams(750.0)?));
+//! assert_eq!(event.quantity_before, StockAmount::Mass { quantity: grams(1_000.0)?, mass_per_piece: None });
+//! assert_eq!(stock.quantity(), StockAmount::Mass { quantity: grams(750.0)?, mass_per_piece: None });
 //!
 //! // Counts use integers, so a fractional keyboard cannot be constructed.
 //! let keyboard_id = Id::<Item>::new();

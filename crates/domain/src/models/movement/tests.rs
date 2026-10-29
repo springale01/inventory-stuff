@@ -49,12 +49,24 @@ fn fractional_mass_can_be_received_removed_to_zero_and_received_again() {
         .unwrap()
         .execute(&mut stock)
         .unwrap();
-    assert_eq!(event.quantity_after, StockAmount::Mass(grams(749.5)));
+    assert_eq!(
+        event.quantity_after,
+        StockAmount::Mass {
+            quantity: grams(749.5),
+            mass_per_piece: None
+        }
+    );
     RemoveCmd::new(id, grams(749.5), "Remaining sale")
         .unwrap()
         .execute(&mut stock)
         .unwrap();
-    assert_eq!(stock.quantity(), StockAmount::Mass(grams(0.0)));
+    assert_eq!(
+        stock.quantity(),
+        StockAmount::Mass {
+            quantity: grams(0.0),
+            mass_per_piece: None
+        }
+    );
     // A zero mass balance is still mass, never an untyped zero or a count.
     assert_eq!(
         AddCmd::new(id, 1_u64, "Wrong unit")
@@ -67,7 +79,130 @@ fn fractional_mass_can_be_received_removed_to_zero_and_received_again() {
         .unwrap()
         .execute(&mut stock)
         .unwrap();
-    assert_eq!(stock.quantity(), StockAmount::Mass(grams(0.5)));
+    assert_eq!(
+        stock.quantity(),
+        StockAmount::Mass {
+            quantity: grams(0.5),
+            mass_per_piece: None
+        }
+    );
+}
+
+#[test]
+fn mass_movements_preserve_piece_weight_and_compare_quantities() {
+    let id = Id::<Item>::new();
+    let balance = StockAmount::Mass {
+        quantity: grams(1_000.0),
+        mass_per_piece: Some(grams(2.5)),
+    };
+    assert_eq!(balance.to_string(), "1000 g");
+    assert_eq!(balance.estimated_piece_count().unwrap(), Some(400.0));
+    assert_eq!(
+        StockAmount::from(grams(250.0)),
+        StockAmount::Mass {
+            quantity: grams(250.0),
+            mass_per_piece: None,
+        }
+    );
+    let mut stock = Stock::new(id, balance, grams(1_000.0)).unwrap();
+    assert!(stock.is_low());
+    let added = AddCmd::new(id, grams(250.0), "Delivery")
+        .unwrap()
+        .execute(&mut stock)
+        .unwrap();
+    assert_eq!(added.quantity_before, balance);
+    assert_eq!(
+        added.quantity_after,
+        StockAmount::Mass {
+            quantity: grams(1_250.0),
+            mass_per_piece: Some(grams(2.5)),
+        }
+    );
+    assert!(!stock.is_low());
+    assert_eq!(
+        stock.quantity().estimated_piece_count().unwrap(),
+        Some(500.0)
+    );
+    let removal = StockAmount::Mass {
+        quantity: grams(1_250.0),
+        mass_per_piece: Some(grams(5.0)),
+    };
+    let removed = RemoveCmd::new(id, removal, "Sale")
+        .unwrap()
+        .execute(&mut stock)
+        .unwrap();
+    assert_eq!(removed.amount, removal);
+    assert_eq!(
+        stock.quantity(),
+        StockAmount::Mass {
+            quantity: grams(0.0),
+            mass_per_piece: Some(grams(2.5)),
+        }
+    );
+    assert!(stock.is_low());
+    assert_eq!(stock.quantity().estimated_piece_count().unwrap(), Some(0.0));
+    assert_eq!(
+        AddCmd::new(id, stock.quantity(), "Zero delivery").unwrap_err(),
+        StockError::ZeroQuantityAdjustment
+    );
+}
+
+#[test]
+fn piece_estimates_handle_missing_weights_fractional_counts_and_numeric_limits() {
+    assert_eq!(
+        StockAmount::Count(u64::MAX)
+            .estimated_piece_count()
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        StockAmount::from(grams(100.0))
+            .estimated_piece_count()
+            .unwrap(),
+        None
+    );
+    let mass = |total, per_piece| StockAmount::Mass {
+        quantity: grams(total),
+        mass_per_piece: Some(grams(per_piece)),
+    };
+    assert_eq!(mass(10.0, 4.0).estimated_piece_count().unwrap(), Some(2.5));
+    assert_eq!(
+        mass(f64::MAX, 0.5).estimated_piece_count(),
+        Err(StockError::Quantity(QuantityError::Overflow))
+    );
+    assert_eq!(
+        mass(f64::from_bits(1), f64::MAX).estimated_piece_count(),
+        Err(StockError::Quantity(QuantityError::Underflow))
+    );
+}
+
+#[test]
+fn zero_piece_weight_is_rejected_by_balances_commands_and_estimates() {
+    let id = Id::<Item>::new();
+    let invalid = StockAmount::Mass {
+        quantity: grams(100.0),
+        mass_per_piece: Some(grams(0.0)),
+    };
+    assert_eq!(
+        Stock::new(id, invalid, grams(0.0)).unwrap_err(),
+        StockError::ZeroMassPerPiece
+    );
+    assert_eq!(
+        Stock::new(id, grams(100.0), invalid).unwrap_err(),
+        StockError::ZeroMassPerPiece
+    );
+    assert_eq!(
+        AddCmd::new(id, invalid, "Delivery").unwrap_err(),
+        StockError::ZeroMassPerPiece
+    );
+    assert_eq!(
+        RemoveCmd::new(id, invalid, "Sale").unwrap_err(),
+        StockError::ZeroMassPerPiece
+    );
+    assert_eq!(
+        invalid.estimated_piece_count(),
+        Err(StockError::ZeroMassPerPiece)
+    );
 }
 
 #[test]
@@ -162,7 +297,13 @@ fn mass_failures_preserve_the_balance() {
             .unwrap_err(),
         StockError::PrecisionLoss
     );
-    assert_eq!(stock.quantity(), StockAmount::Mass(grams(f64::MAX)));
+    assert_eq!(
+        stock.quantity(),
+        StockAmount::Mass {
+            quantity: grams(f64::MAX),
+            mass_per_piece: None
+        }
+    );
 
     let mut stock = Stock::new(id, grams(0.5), grams(0.0)).unwrap();
     assert!(matches!(
@@ -171,7 +312,13 @@ fn mass_failures_preserve_the_balance() {
             .execute(&mut stock),
         Err(StockError::InsufficientStock { .. })
     ));
-    assert_eq!(stock.quantity(), StockAmount::Mass(grams(0.5)));
+    assert_eq!(
+        stock.quantity(),
+        StockAmount::Mass {
+            quantity: grams(0.5),
+            mass_per_piece: None
+        }
+    );
 }
 
 #[test]

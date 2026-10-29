@@ -1,9 +1,12 @@
 use domain::{
     models::{
         sku::{Sku, SkuBuilder},
-        stock::{Item, StockUnit},
+        stock::{Item, StockAmount, StockError, StockUnit},
     },
-    tools::id::Id,
+    tools::{
+        id::Id,
+        units::{Grams, Quantity},
+    },
 };
 use persistance::{InventoryError, PageRequest, PineappleDatabase, TrackingMode};
 use settings::database::DatabaseSettings;
@@ -213,15 +216,18 @@ async fn bulk_adjustments_reject_underflow_overflow_and_keep_previous_quantity()
     db.remove_bulk(value.id, 3).await.unwrap();
     assert!(matches!(
         db.remove_bulk(value.id, 8).await,
-        Err(InventoryError::InsufficientStock {
-            available: 7,
-            requested: 8
-        })
+        Err(InventoryError::Stock(StockError::InsufficientStock {
+            available: StockAmount::Count(7),
+            requested: StockAmount::Count(8)
+        }))
     ));
-    assert_eq!(db.get_stock(value.id).await.unwrap().unwrap().quantity, 7);
+    assert_eq!(
+        db.get_stock(value.id).await.unwrap().unwrap().quantity,
+        StockAmount::Count(7)
+    );
     assert!(matches!(
         db.receive_bulk(value.id, 0).await,
-        Err(InventoryError::InvalidInput(_))
+        Err(InventoryError::Stock(StockError::ZeroQuantityAdjustment))
     ));
     assert!(matches!(
         db.delete_item(value.id).await,
@@ -240,7 +246,7 @@ async fn bulk_adjustments_reject_underflow_overflow_and_keep_previous_quantity()
     ));
     assert_eq!(
         db.get_stock(value.id).await.unwrap().unwrap().quantity,
-        i64::MAX as u64
+        StockAmount::Count(i64::MAX as u64)
     );
     db.set_bulk_quantity(value.id, 0).await.unwrap();
     assert!(db.get_stock(value.id).await.unwrap().unwrap().is_low());
@@ -278,7 +284,10 @@ async fn units_are_atomic_and_removal_checks_item_ownership() {
     db.receive_units(first.id, &[new, unit(None)])
         .await
         .unwrap();
-    assert_eq!(db.get_stock(first.id).await.unwrap().unwrap().quantity, 3);
+    assert_eq!(
+        db.get_stock(first.id).await.unwrap().unwrap().quantity,
+        StockAmount::Count(3)
+    );
     assert_eq!(db.list_units(first.id, 1, 1).await.unwrap().len(), 1);
     assert!(matches!(
         db.delete_item(first.id).await,
@@ -293,7 +302,10 @@ async fn units_are_atomic_and_removal_checks_item_ownership() {
         Some("SN-1")
     );
     assert!(db.get_unit(first.id, existing.id).await.unwrap().is_none());
-    assert_eq!(db.get_stock(first.id).await.unwrap().unwrap().quantity, 2);
+    assert_eq!(
+        db.get_stock(first.id).await.unwrap().unwrap().quantity,
+        StockAmount::Count(2)
+    );
 }
 
 #[tokio::test]
@@ -403,8 +415,197 @@ async fn concurrent_receipts_do_not_lose_updates() {
             }
         },
     );
-    assert_eq!(db.get_stock(value.id).await.unwrap().unwrap().quantity, 40);
+    assert_eq!(
+        db.get_stock(value.id).await.unwrap().unwrap().quantity,
+        StockAmount::Count(40)
+    );
+    let events = db.list_movements(value.id, 100, 0).await.unwrap();
+    assert_eq!(events.len(), 40);
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event.quantity_before, StockAmount::Count(index as u64));
+        assert_eq!(event.quantity_after, StockAmount::Count(index as u64 + 1));
+    }
     db.close().await;
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(root).unwrap();
+}
+
+fn mass(value: f64, per_piece: Option<f64>) -> StockAmount {
+    StockAmount::Mass {
+        quantity: Quantity::<Grams>::new(value).unwrap(),
+        mass_per_piece: per_piece.map(|value| Quantity::new(value).unwrap()),
+    }
+}
+
+#[tokio::test]
+async fn mass_stock_and_movements_round_trip_with_piece_weights_and_reasons() {
+    let db = database().await;
+    let value = item("BOLTS");
+    db.create_item(&value, TrackingMode::Bulk, mass(100.0, Some(2.5)))
+        .await
+        .unwrap();
+    let before = db.get_inventory(value.id).await.unwrap().unwrap();
+    assert_eq!(before.stock.quantity(), mass(0.0, Some(2.5)));
+    assert!(before.units.is_none());
+    assert_eq!(db.list_stock(true, 10, 0).await.unwrap().len(), 1);
+    let added = db
+        .add_stock(value.id, mass(1_000.0, None), "Delivery 'quoted'")
+        .await
+        .unwrap();
+    assert_eq!(added.quantity_after, mass(1_000.0, Some(2.5)));
+    assert!(db.list_stock(true, 10, 0).await.unwrap().is_empty());
+    let removed = db
+        .remove_stock(value.id, mass(250.5, None), "Weighed sale")
+        .await
+        .unwrap();
+    let loaded = db.get_inventory(value.id).await.unwrap().unwrap();
+    assert_eq!(loaded.stock.quantity(), mass(749.5, Some(2.5)));
+    assert_eq!(
+        loaded.stock.quantity().estimated_piece_count().unwrap(),
+        Some(299.8)
+    );
+    let events = db.list_movements(value.id, 10, 0).await.unwrap();
+    assert_eq!(events.len(), 2);
+    for (saved, expected) in events.iter().zip([&added, &removed]) {
+        assert_eq!(saved.id, expected.id);
+        assert_eq!(saved.kind, expected.kind);
+        assert_eq!(saved.amount, expected.amount);
+        assert_eq!(saved.quantity_before, expected.quantity_before);
+        assert_eq!(saved.quantity_after, expected.quantity_after);
+        assert_eq!(saved.reason, expected.reason);
+        assert_eq!(saved.occurred_at, expected.occurred_at);
+    }
+    assert_eq!(
+        db.list_movements(value.id, 1, 1).await.unwrap()[0].id,
+        removed.id
+    );
+    db.set_low_stock_at(value.id, mass(749.5, None))
+        .await
+        .unwrap();
+    assert!(db.get_stock(value.id).await.unwrap().unwrap().is_low());
+    assert_eq!(db.list_stock(true, 10, 0).await.unwrap().len(), 1);
+    assert!(matches!(
+        db.delete_item(value.id).await,
+        Err(InventoryError::StockNotEmpty)
+    ));
+    db.remove_stock(value.id, mass(749.5, None), "Remaining sale")
+        .await
+        .unwrap();
+    db.delete_item(value.id).await.unwrap();
+    assert!(db.get_inventory(value.id).await.unwrap().is_none());
+    assert_eq!(db.list_movements(value.id, 10, 0).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn rejected_mass_operations_preserve_balance_threshold_and_history() {
+    let db = database().await;
+    let value = item("MASS");
+    assert!(matches!(
+        db.create_item(&value, TrackingMode::Individual, mass(0.0, None))
+            .await,
+        Err(InventoryError::WrongTrackingMode)
+    ));
+    assert!(matches!(
+        db.create_item(&value, TrackingMode::Bulk, mass(0.0, Some(0.0)))
+            .await,
+        Err(InventoryError::Stock(StockError::ZeroMassPerPiece))
+    ));
+    assert!(db.get_item(value.id).await.unwrap().is_none());
+    db.create_item(&value, TrackingMode::Bulk, mass(0.5, None))
+        .await
+        .unwrap();
+    db.add_stock(value.id, mass(1.0, None), "Receipt")
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.add_stock(value.id, 1_u64, "Wrong unit").await,
+        Err(InventoryError::Stock(StockError::MeasurementMismatch))
+    ));
+    assert!(matches!(
+        db.set_low_stock_at(value.id, 0_u64).await,
+        Err(InventoryError::Stock(StockError::MeasurementMismatch))
+    ));
+    assert!(matches!(
+        db.remove_stock(value.id, mass(2.0, None), "Too much").await,
+        Err(InventoryError::Stock(StockError::InsufficientStock { .. }))
+    ));
+    assert!(matches!(
+        db.add_stock(value.id, mass(1.0, None), " \t").await,
+        Err(InventoryError::Stock(StockError::EmptyReason))
+    ));
+    assert!(matches!(
+        db.remove_stock(value.id, mass(0.0, None), "Zero").await,
+        Err(InventoryError::Stock(StockError::ZeroQuantityAdjustment))
+    ));
+    let loaded = db.get_stock(value.id).await.unwrap().unwrap();
+    assert_eq!(loaded.quantity, mass(1.0, None));
+    assert_eq!(loaded.low_stock_at, mass(0.5, None));
+    assert_eq!(db.list_movements(value.id, 10, 0).await.unwrap().len(), 1);
+    let huge = item("HUGE");
+    db.create_item(&huge, TrackingMode::Bulk, mass(0.0, None))
+        .await
+        .unwrap();
+    db.add_stock(huge.id, mass(f64::MAX, None), "Receipt")
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.add_stock(huge.id, mass(f64::MAX, None), "Overflow")
+            .await,
+        Err(InventoryError::Stock(StockError::Quantity(_)))
+    ));
+    assert!(matches!(
+        db.remove_stock(huge.id, mass(1.0, None), "Rounded away")
+            .await,
+        Err(InventoryError::Stock(StockError::PrecisionLoss))
+    ));
+    assert_eq!(
+        db.get_stock(huge.id).await.unwrap().unwrap().quantity,
+        mass(f64::MAX, None)
+    );
+    assert_eq!(db.list_movements(huge.id, 10, 0).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn audit_failure_rolls_back_balance_and_individual_units() {
+    let db = database().await;
+    let bulk = item("BULK-ROLLBACK");
+    let individual = item("UNITS-ROLLBACK");
+    db.create_item(&bulk, TrackingMode::Bulk, 0).await.unwrap();
+    db.create_item(&individual, TrackingMode::Individual, 0)
+        .await
+        .unwrap();
+    let existing = unit(None);
+    db.receive_units(individual.id, std::slice::from_ref(&existing))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_audit BEFORE INSERT ON stock_movements BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END")
+        .execute(db.pool()).await.unwrap();
+    assert!(matches!(
+        db.add_stock(bulk.id, 5_u64, "Receipt").await,
+        Err(InventoryError::Sql(_))
+    ));
+    assert!(matches!(
+        db.receive_units(individual.id, &[unit(None)]).await,
+        Err(InventoryError::Sql(_))
+    ));
+    assert!(matches!(
+        db.remove_unit(individual.id, existing.id).await,
+        Err(InventoryError::Sql(_))
+    ));
+    assert_eq!(
+        db.get_stock(bulk.id).await.unwrap().unwrap().quantity,
+        StockAmount::Count(0)
+    );
+    assert!(db.list_movements(bulk.id, 10, 0).await.unwrap().is_empty());
+    let state = db.get_inventory(individual.id).await.unwrap().unwrap();
+    assert_eq!(state.stock.quantity(), StockAmount::Count(1));
+    assert_eq!(state.units.unwrap()[0].id, existing.id);
+    assert_eq!(
+        db.list_movements(individual.id, 10, 0).await.unwrap().len(),
+        1
+    );
+    assert!(matches!(
+        db.add_stock(individual.id, 1_u64, "No unit identity").await,
+        Err(InventoryError::WrongTrackingMode)
+    ));
 }
