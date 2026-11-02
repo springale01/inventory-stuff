@@ -40,15 +40,18 @@ pub(crate) mod event_handler {
     }
 }
 
-pub mod inventory_worker {
+pub(crate) mod inventory_worker {
 
     use domain::{
         Request,
-        models::stock::{Item, Stock, StockAmount, StockError, StockUnit},
+        models::{
+            sku::Sku,
+            stock::{Item, Stock, StockAmount, StockError, StockUnit},
+        },
         tools::{id::Id, snapshot::Snapshot},
     };
     use persistance::PineappleDatabase;
-    use tokio::{sync::OnceCell, task::JoinHandle};
+    use tokio::task::JoinHandle;
 
     use crate::handlers::event_handler::{Envelope, WorkerHandle};
 
@@ -119,6 +122,14 @@ pub mod inventory_worker {
                         units: state.units,
                     })
                 }
+                InventoryMessage::GetBySku { sku } => {
+                    let item = db
+                        .get_item_by_sku(&sku)
+                        .await?
+                        .ok_or(persistance::InventoryError::NotFound("sku"))?;
+
+                    Ok(InventoryResponse::SkuItem { item })
+                }
             }
         }
     }
@@ -154,6 +165,9 @@ pub mod inventory_worker {
         Get {
             item: Id<Item>,
         },
+        GetBySku {
+            sku: Sku,
+        },
     }
 
     pub enum InventoryResponse {
@@ -162,7 +176,12 @@ pub mod inventory_worker {
             units: Option<Box<[StockUnit]>>,
         },
         /// Add / Remove returns this one
-        AmountChanged { after_amount: Snapshot<StockAmount> },
+        AmountChanged {
+            after_amount: Snapshot<StockAmount>,
+        },
+        SkuItem {
+            item: Item,
+        },
     }
 
     impl Request for InventoryMessage {
@@ -332,3 +351,9 @@ pub mod inventory_worker {
         }
     }
 }
+
+pub(crate) mod tui_stuff {
+    // todo
+}
+// tracing would handle these stuff
+pub(crate) mod logging_stuff {}

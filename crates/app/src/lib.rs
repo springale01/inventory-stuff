@@ -1,6 +1,5 @@
 mod handlers;
 mod state;
-use std::cell::LazyCell;
 
 pub use state::AppState;
 
