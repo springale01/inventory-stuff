@@ -143,7 +143,7 @@ impl AsRef<str> for SkuType {
 }
 
 // this one would be persistant and if you want a next up sku of a item you just call smt like ".next()"
-mod sku_but_with_a_counter {
+pub mod sku_but_with_a_counter {
     use std::{
         borrow::Cow,
         marker::PhantomData,

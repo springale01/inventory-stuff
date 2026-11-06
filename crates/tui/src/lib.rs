@@ -1,7 +1,8 @@
 //! Terminal entry point. Pages own display state; the app crate owns use cases.
-mod clap;
+pub mod clap_things;
+pub(crate) mod tools;
 pub mod widgets;
-pub(crate) mod workers;
+pub mod workers;
 use std::io;
 use widgets::inventory_ui::InventoryUi;
 

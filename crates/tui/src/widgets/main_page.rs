@@ -10,6 +10,8 @@ use ratatui::{
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
+use crate::tools::key::KeyHandler;
+
 /// Display data for this count-based demo, not a replacement domain item model.
 /// Later, map the result of an app operation into these rows.
 pub struct ItemRow {
@@ -273,5 +275,18 @@ impl MainPage {
                 .wrap(Wrap { trim: true })
                 .block(Block::bordered().title("Help").border_style(Style::default().fg(Color::Cyan))), popup,
         );
+    }
+}
+// ----- Expriments -----
+pub struct MainPageV2 {
+    items: ItemRow,
+    table: TableState,
+}
+
+struct MainPageKeyHandler {}
+
+impl KeyHandler for MainPageKeyHandler {
+    fn handle_key(&self, key: crossterm::event::KeyEvent) -> () {
+        todo!()
     }
 }
