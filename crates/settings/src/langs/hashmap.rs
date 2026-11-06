@@ -8,12 +8,18 @@ use super::{Dictionary, LanguagePack, TextKey};
 /// Duplicate keys use the last supplied value.
 #[derive(Debug, Clone, Default)]
 pub struct HashMapDictionary {
+    name: Box<str>,
     entries: HashMap<TextKey, String>,
 }
 
 impl HashMapDictionary {
-    pub fn new(entries: impl IntoIterator<Item = (TextKey, String)>) -> Self {
+    /// Use this if you have all it's items
+    pub fn new(
+        entries: impl IntoIterator<Item = (TextKey, String)>,
+        name: impl Into<Box<str>>,
+    ) -> Self {
         Self {
+            name: name.into(),
             entries: entries.into_iter().collect(),
         }
     }
@@ -30,6 +36,10 @@ impl Dictionary for HashMapDictionary {
 
     fn get(&self, key: TextKey) -> Option<&str> {
         self.entries.get(&key).map(String::as_str)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 

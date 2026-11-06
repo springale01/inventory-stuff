@@ -9,3 +9,5 @@ crossterm.workspace = true
 tokio.workspace = true
 app = { path = "../app" }
 settings = { path = "../settings" }
+dotenvy.workspace = true
+clap.workspace = true

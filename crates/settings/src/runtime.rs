@@ -1,6 +1,9 @@
 use std::num::NonZeroUsize;
 
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuntimeSettings {
     mpsc_channel_capacity: NonZeroUsize,
 }

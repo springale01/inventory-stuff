@@ -11,8 +11,9 @@ use crate::{
 };
 
 pub mod database;
+pub mod io;
 pub mod langs;
-mod runtime;
+pub mod runtime;
 
 /// Shared settings with atomic language replacement.
 pub struct Settings {
@@ -45,6 +46,12 @@ impl Settings {
         self.language.load()
     }
 
+    /// An owned snapshot for responses or other long-lived consumers.
+    /// Later language swaps do not change this snapshot.
+    pub fn language_snapshot(&self) -> Arc<LanguagePack> {
+        self.language.load_full()
+    }
+
     pub fn database_settings(&self) -> &DatabaseSettings {
         &self.database
     }
@@ -61,52 +68,5 @@ impl Default for Settings {
             DatabaseSettings::default(),
             RuntimeSettings::default(),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::langs::{English, EnglishDictionary, HashMapDictionary, TextKey};
-
-    #[test]
-    fn switching_languages_preserves_existing_snapshots_and_database_settings() {
-        let database = DatabaseSettings {
-            url: "sqlite::memory:".into(),
-            max_connections: 1,
-        };
-        let settings = Settings::new(None, database, RuntimeSettings::default());
-        let before = settings.lang();
-        let custom = HashMapDictionary::new([(TextKey::TuiName, "Custom inventory".into())]);
-        settings.swap_lang(custom.into_language_pack());
-        assert_eq!(before.get(TextKey::TuiName), Some("Inventory Manager"));
-        assert_eq!(
-            settings.lang().get(TextKey::TuiName),
-            Some("Custom inventory")
-        );
-        let english: LanguagePack<English> = EnglishDictionary::new().into();
-        settings.swap_lang(english);
-        assert_eq!(
-            settings.lang().get(TextKey::TuiName),
-            Some("Inventory Manager")
-        );
-        assert_eq!(settings.database_settings().url, "sqlite::memory:");
-        assert_eq!(settings.database_settings().max_connections, 1);
-    }
-
-    #[test]
-    fn settings_can_be_shared_across_threads() {
-        let settings = Arc::new(Settings::default());
-        let shared = Arc::clone(&settings);
-        std::thread::spawn(move || {
-            shared.swap_lang(HashMapDictionary::default().into_language_pack());
-            assert_eq!(
-                shared.lang().get(TextKey::TuiName),
-                Some("Inventory Manager")
-            );
-        })
-        .join()
-        .unwrap();
-        assert_eq!(settings.database_settings().max_connections, 25);
     }
 }

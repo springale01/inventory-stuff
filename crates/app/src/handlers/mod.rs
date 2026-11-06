@@ -352,6 +352,8 @@ pub(crate) mod inventory_worker {
     }
 }
 
+pub(crate) mod settings_worker;
+// ------ Rename Those or delete those because it's placeholding
 pub(crate) mod tui_stuff {
     // todo
 }

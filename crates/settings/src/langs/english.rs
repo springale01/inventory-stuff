@@ -29,6 +29,9 @@ impl Dictionary for EnglishDictionary {
     fn get(&self, key: TextKey) -> Option<&str> {
         ENGLISH_DICT.get(&key).copied()
     }
+    fn name(&self) -> &'static str {
+        "english"
+    }
 }
 
 impl From<EnglishDictionary> for LanguagePack<English> {

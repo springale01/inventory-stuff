@@ -10,6 +10,7 @@ pub trait Dictionary: Send + Sync {
     /// Iterates this dictionary's entries in an unspecified order.
     fn items(&self) -> Box<dyn Iterator<Item = (TextKey, &str)> + Send + '_>;
     fn get(&self, key: TextKey) -> Option<&str>;
+    fn name(&self) -> &str;
 }
 
 /// A selected dictionary with English fallback for missing keys.
@@ -29,8 +30,10 @@ where
     pub fn dict(&self) -> &dyn Dictionary {
         self.dictionary.as_ref()
     }
-
-    pub(super) fn new(dictionary: Box<dyn Dictionary>) -> Self {
+    pub fn name(&self) -> &str {
+        self.dict().name()
+    }
+    pub(crate) fn new(dictionary: Box<dyn Dictionary>) -> Self {
         Self {
             dictionary,
             _marker: PhantomData,
