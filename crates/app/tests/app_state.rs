@@ -1,20 +1,9 @@
+use app::domain::{Id, Item, Sku, StockAmount, StockError, StockUnit};
+use app::settings::{
+    DatabaseSettings, LanguageSource, SettingsIO, SettingsModel, TextFile, TextKey,
+};
 use app::{AppError, AppState, InventoryError};
-use domain::{
-    models::{
-        sku::Sku,
-        stock::{Item, StockAmount, StockError, StockUnit},
-    },
-    tools::id::Id,
-};
 use persistance::{PineappleDatabase, TrackingMode};
-use settings::{
-    database::DatabaseSettings,
-    io::{
-        settings_reader::{SettingsIO, SettingsModel},
-        text_file::TextFile,
-    },
-    langs::{LanguageSource, TextKey},
-};
 use std::{path::PathBuf, time::Duration};
 use tokio::time::timeout;
 
@@ -75,8 +64,12 @@ async fn public_use_cases_persist_balances_and_preserve_inventory_errors() {
     let state = AppState::from_database(db.clone(), Some(directory.settings_path().await))
         .await
         .unwrap();
+    let inventory_handle = state.inventory_handle().clone();
 
-    let found = state.get_item_by_sku(item.sku.clone()).await.unwrap();
+    let found = inventory_handle
+        .get_item_by_sku(item.sku.clone())
+        .await
+        .unwrap();
     assert_eq!(found.id, item.id);
     assert_eq!(
         *state
@@ -152,6 +145,12 @@ async fn public_use_cases_persist_balances_and_preserve_inventory_errors() {
         StockAmount::Count(8)
     );
     assert_eq!(db.list_movements(found.id, 10, 0).await.unwrap().len(), 3);
+    assert!(matches!(
+        inventory_handle.get_inventory(found.id).await,
+        Err(AppError::WorkerUnavailable {
+            worker_name: "inventory"
+        })
+    ));
 }
 
 #[tokio::test]

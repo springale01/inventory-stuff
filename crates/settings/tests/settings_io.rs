@@ -3,13 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use settings::{
-    io::{
-        settings_reader::{SettingsIO, SettingsModel},
-        text_file::TextFile,
-    },
-    langs::{LanguageSource, TextKey},
-};
+use settings::{LanguageSource, SettingsIO, SettingsModel, TextFile, TextKey};
 
 struct TestDirectory(PathBuf);
 

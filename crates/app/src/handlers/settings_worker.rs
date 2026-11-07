@@ -2,12 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use domain::Request;
 use settings::{
-    Settings,
-    io::{
-        SettingsIoError,
-        settings_reader::{SettingsIO, SettingsModel},
-    },
-    langs::{LanguagePack, LanguageSource},
+    LanguagePack, LanguageSource, Settings, SettingsIO, SettingsIoError, SettingsModel,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -110,7 +105,7 @@ pub struct SettingsHandle {
 
 impl SettingsHandle {
     /// Stops new submissions while allowing already accepted messages to drain.
-    pub(crate) async fn close(&self) -> Result<(), SettingsError> {
+    pub async fn close(&self) -> Result<(), SettingsError> {
         match self.request(SettingsMessage::Close).await? {
             SettingsResponse::Closing => Ok(()),
             _ => Err(SettingsError::UnexpectedResponse),

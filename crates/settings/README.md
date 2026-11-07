@@ -1,4 +1,22 @@
-# Language dictionaries
+# Settings API
+
+Import supported types directly from the crate root, for example:
+
+```rust
+use settings::{DatabaseSettings, LanguageSource, RuntimeSettings, Settings, SettingsModel};
+
+let model = SettingsModel::default();
+assert_eq!(model.language, LanguageSource::BuiltInEnglish);
+let settings = Settings::new(None, DatabaseSettings::default(), RuntimeSettings::default());
+assert_eq!(settings.lang().name(), "english");
+```
+
+File APIs (`SettingsIO`, `LanguageIO`, `TextFile`), serialized models, language
+types, and their errors are exported from the root. Existing `io`, `langs`,
+`database`, and `runtime` paths remain available. File operations return
+`SettingsIoError`; runtime settings contain no file handles.
+
+## Language dictionaries
 
 UI code uses `TextKey` rather than English strings as lookup keys. English is
 stored once in a lazily initialized hashmap. A `LanguagePack` owns a thread-safe,
@@ -6,7 +24,7 @@ dynamically dispatched `Dictionary`, so different dictionary implementations can
 be selected at runtime.
 
 ```rust
-use settings::{Settings, langs::{HashMapDictionary, TextKey}};
+use settings::{HashMapDictionary, Settings, TextKey};
 
 let custom = HashMapDictionary::new([
     (TextKey::TuiName, "Gestion des stocks".to_owned()),
@@ -101,7 +119,7 @@ fully loaded before publication. `LanguagePack` serves translations and performs
 no file I/O; `LanguageIO` owns its `TextFile` and parses the dictionary.
 
 ```rust,no_run
-use settings::io::settings_reader::SettingsIO;
+use settings::SettingsIO;
 
 # async fn example() -> Result<(), settings::io::SettingsIoError> {
 let io = SettingsIO::new(Some("config/settings.toml".into()));
@@ -136,7 +154,7 @@ let app_state = app::AppState::new(Some("settings.toml".into())).await?;
 let handle = app_state.settings_handle().clone();
 let active = app_state.settings(); // Arc<Settings>, shared with the worker and UI
 
-handle.change_language(settings::langs::LanguageSource::File {
+handle.change_language(settings::LanguageSource::File {
     path: "languages/pirate.toml".into(),
 }).await?;
 

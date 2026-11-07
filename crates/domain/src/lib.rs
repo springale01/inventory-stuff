@@ -1,13 +1,32 @@
+#![doc = include_str!("../README.md")]
+
 use std::pin::Pin;
 
 pub mod models;
 pub mod tools;
-/// Abstractions for later
 
+pub use models::{
+    movement::{AddCmd, MovementEvent, MovementKind, RemoveCmd},
+    sku::{
+        CounterExhausted, CounterSkuBuilder, CounterSkuSupplier, InvalidSku, Sku, SkuBuilder,
+        SkuFamily, SkuType,
+    },
+    stock::{Item, Stock, StockAmount, StockError, StockUnit},
+};
+pub use tools::{
+    id::Id,
+    snapshot::Snapshot,
+    units::{
+        Grams, Kilograms, Liters, Mass, Milliliters, Ounces, Pounds, Quantity, QuantityError, Unit,
+        Volume,
+    },
+};
+
+/// A request declares its successful response; execution errors are separate.
 pub trait Request {
     type Response: Send;
 }
-/// Abstraction for later
+/// An asynchronous request handler. The returned future may borrow the handler.
 pub trait Handle<T>
 where
     T: Request,
@@ -19,5 +38,5 @@ where
         &self,
         ctx: Self::Context,
         req: T,
-    ) -> Pin<Box<dyn Future<Output = Result<T::Response, Self::Error>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = Result<T::Response, Self::Error>> + Send + '_>>;
 }

@@ -8,6 +8,4 @@ thiserror.workspace = true
 persistance = { path = "../persistance" }
 domain = { path = "../domain" }
 settings = { path = "../settings" }
-arc-swap.workspace = true
 tokio.workspace = true
-moka.workspace = true

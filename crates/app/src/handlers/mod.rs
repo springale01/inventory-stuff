@@ -1,13 +1,4 @@
-/// Makes some structs
-macro_rules! dataclass {
-    ($struct_name:ident; $($name:ident: $ty:ty);* $(;)?) => {
-        struct $struct_name {
-            $(
-                pub $name: $ty,
-            )+
-        }
-    };
-}
+pub(crate) mod inventory_handle;
 
 pub(crate) mod event_handler {
     use domain::Request;
@@ -42,17 +33,11 @@ pub(crate) mod event_handler {
 
 pub(crate) mod inventory_worker {
 
-    use domain::{
-        Request,
-        models::{
-            sku::Sku,
-            stock::{Item, Stock, StockAmount, StockError, StockUnit},
-        },
-        tools::{id::Id, snapshot::Snapshot},
-    };
+    use domain::{Id, Item, Request, Sku, Snapshot, Stock, StockAmount, StockError, StockUnit};
     use persistance::PineappleDatabase;
     use tokio::task::JoinHandle;
 
+    use super::inventory_handle::InventoryHandle;
     use crate::handlers::event_handler::{Envelope, WorkerHandle};
 
     pub(crate) struct InventoryWorker {
@@ -64,10 +49,10 @@ pub(crate) mod inventory_worker {
         pub fn new(
             db: PineappleDatabase,
             channel_capacity: Option<usize>,
-        ) -> (Self, WorkerHandle<InventoryMessage, InventoryError>) {
+        ) -> (Self, InventoryHandle) {
             let (tx, rx) = tokio::sync::mpsc::channel(channel_capacity.unwrap_or(100));
 
-            let handle = WorkerHandle::new(tx);
+            let handle = InventoryHandle::new(WorkerHandle::new(tx));
 
             (Self { db, rx }, handle)
         }
@@ -79,6 +64,9 @@ pub(crate) mod inventory_worker {
                 while let Some(thing) = rx.recv().await {
                     let Envelope { req, reply_to } = thing;
 
+                    if matches!(&req, InventoryMessage::Close) {
+                        rx.close();
+                    }
                     let result = Self::handle(&db, req).await;
                     // A caller may stop waiting after submission. The operation
                     // still completes, and the worker keeps serving its mailbox.
@@ -92,6 +80,7 @@ pub(crate) mod inventory_worker {
             req: InventoryMessage,
         ) -> Result<InventoryResponse, InventoryError> {
             match req {
+                InventoryMessage::Close => Ok(InventoryResponse::Closing),
                 InventoryMessage::Add {
                     item,
                     amount,
@@ -152,6 +141,7 @@ pub(crate) mod inventory_worker {
     }
 
     pub enum InventoryMessage {
+        Close,
         Add {
             item: Id<Item>,
             amount: StockAmount,
@@ -171,6 +161,7 @@ pub(crate) mod inventory_worker {
     }
 
     pub enum InventoryResponse {
+        Closing,
         GottenUnits {
             stock: Snapshot<Stock>,
             units: Option<Box<[StockUnit]>>,
@@ -185,7 +176,7 @@ pub(crate) mod inventory_worker {
     }
 
     impl Request for InventoryMessage {
-        type Response = InventoryResponse; // Placeholder
+        type Response = InventoryResponse;
     }
 
     #[cfg(test)]
@@ -201,7 +192,7 @@ pub(crate) mod inventory_worker {
         use tokio::time::timeout;
 
         async fn request(
-            handle: &WorkerHandle<InventoryMessage, InventoryError>,
+            handle: &InventoryHandle,
             req: InventoryMessage,
         ) -> Result<InventoryResponse, InventoryError> {
             let (reply_to, response) = tokio::sync::oneshot::channel();

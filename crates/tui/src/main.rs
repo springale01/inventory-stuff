@@ -1,8 +1,12 @@
 use clap::Parser;
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = tui::clap_things::Args::parse();
-    app::statics::set_statics(args.settings_location);
+    app::set_statics(args.settings_location)?;
 
-    tui::run()
+    let ui_result = tui::run();
+    let shutdown_result = app::shutdown_statics();
+    ui_result?;
+    shutdown_result?;
+    Ok(())
 }

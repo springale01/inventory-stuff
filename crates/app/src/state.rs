@@ -1,22 +1,13 @@
 use std::{path::PathBuf, sync::Arc};
 
-use domain::{
-    models::{
-        sku::Sku,
-        stock::{Item, Stock, StockAmount, StockUnit},
-    },
-    tools::{id::Id, snapshot::Snapshot},
-};
+use domain::{Id, Item, Sku, Snapshot, Stock, StockAmount, StockUnit};
 use persistance::PineappleDatabase;
 use settings::Settings;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::task::JoinHandle;
 
 use crate::{
-    SettingsError, SettingsHandle, SettingsWorker,
-    handlers::{
-        event_handler::{Envelope, WorkerHandle},
-        inventory_worker::{self, InventoryMessage, InventoryResponse, InventoryWorker},
-    },
+    InventoryHandle, SettingsError, SettingsHandle, SettingsWorker,
+    handlers::inventory_worker::{self, InventoryWorker},
 };
 
 /// Application use cases backed by inventory and settings workers.
@@ -91,6 +82,11 @@ impl AppState {
         &self.handles.settings_handle
     }
 
+    /// Clone this handle for inventory requests without borrowing the app/global state.
+    pub fn inventory_handle(&self) -> &InventoryHandle {
+        &self.handles.inventory_handle
+    }
+
     /// Adds stock and returns the persisted balance after the movement.
     pub async fn add_stock(
         &self,
@@ -98,17 +94,10 @@ impl AppState {
         amount: impl Into<StockAmount>,
         reason: impl Into<Box<str>>,
     ) -> Result<Snapshot<StockAmount>, AppError> {
-        match self
-            .request(InventoryMessage::Add {
-                item,
-                amount: amount.into(),
-                reason: reason.into(),
-            })
-            .await?
-        {
-            InventoryResponse::AmountChanged { after_amount } => Ok(after_amount),
-            _ => Err(AppError::UnexpectedResponse),
-        }
+        self.handles
+            .inventory_handle
+            .add_stock(item, amount, reason)
+            .await
     }
 
     /// Removes stock and returns the persisted balance after the movement.
@@ -118,57 +107,30 @@ impl AppState {
         amount: impl Into<StockAmount>,
         reason: impl Into<Box<str>>,
     ) -> Result<Snapshot<StockAmount>, AppError> {
-        match self
-            .request(InventoryMessage::Remove {
-                item,
-                amount: amount.into(),
-                reason: reason.into(),
-            })
-            .await?
-        {
-            InventoryResponse::AmountChanged { after_amount } => Ok(after_amount),
-            _ => Err(AppError::UnexpectedResponse),
-        }
+        self.handles
+            .inventory_handle
+            .remove_stock(item, amount, reason)
+            .await
     }
 
     /// Reads stock and its individual units from one consistent database view.
     pub async fn get_inventory(&self, item: Id<Item>) -> Result<InventorySnapshot, AppError> {
-        match self.request(InventoryMessage::Get { item }).await? {
-            InventoryResponse::GottenUnits { stock, units } => {
-                Ok(InventorySnapshot { stock, units })
-            }
-            _ => Err(AppError::UnexpectedResponse),
-        }
+        self.handles.inventory_handle.get_inventory(item).await
     }
 
     /// Resolves an SKU to its catalog item; a missing SKU is an inventory error.
     pub async fn get_item_by_sku(&self, sku: Sku) -> Result<Item, AppError> {
-        match self.request(InventoryMessage::GetBySku { sku }).await? {
-            InventoryResponse::SkuItem { item } => Ok(item),
-            _ => Err(AppError::UnexpectedResponse),
-        }
-    }
-
-    async fn request(&self, req: InventoryMessage) -> Result<InventoryResponse, AppError> {
-        let (reply_to, response) = oneshot::channel();
-        self.handles
-            .inventory_handle
-            .send(Envelope { req, reply_to })
-            .await
-            .map_err(|_| AppError::WorkerUnavailable {
-                worker_name: "inventory",
-            })?;
-        response
-            .await
-            .map_err(|_| AppError::ResponseDropped)?
-            .map_err(AppError::Inventory)
+        self.handles.inventory_handle.get_item_by_sku(sku).await
     }
     /// Closes both mailboxes and waits for all accepted work, even if one task
-    /// fails. Cloned settings handles cannot keep shutdown open. Shared database
+    /// fails. Cloned handles cannot keep shutdown open. Shared database
     /// pools stay open; once submitted, work completes if its caller stops waiting.
     pub async fn shutdown(self) -> Result<(), AppError> {
         let Self { handles, tasks } = self;
-        let closing = handles.settings_handle.close().await;
+        let (inventory_closing, settings_closing) = tokio::join!(
+            handles.inventory_handle.close(),
+            handles.settings_handle.close(),
+        );
         drop(handles);
         let (inventory, settings) = tokio::join!(tasks.inventory, tasks.settings);
         inventory.map_err(|source| AppError::WorkerTask {
@@ -179,7 +141,8 @@ impl AppState {
             worker_name: "settings",
             source,
         })?;
-        closing.map_err(AppError::Settings)
+        inventory_closing?;
+        settings_closing.map_err(AppError::Settings)
     }
 }
 
@@ -213,19 +176,22 @@ pub enum AppError {
 }
 
 pub(crate) struct Handles {
-    // we can do a Vec later on if we need scaling
-    pub(crate) inventory_handle:
-        WorkerHandle<inventory_worker::InventoryMessage, inventory_worker::InventoryError>,
+    pub(crate) inventory_handle: InventoryHandle,
     pub(crate) settings_handle: SettingsHandle,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::{
+        event_handler::Envelope,
+        inventory_worker::{InventoryMessage, InventoryResponse},
+    };
     use std::{
         sync::atomic::{AtomicBool, Ordering},
         time::Duration,
     };
+    use tokio::sync::oneshot;
 
     async fn test_state() -> (AppState, PineappleDatabase) {
         let db = PineappleDatabase::new(&settings::database::DatabaseSettings {

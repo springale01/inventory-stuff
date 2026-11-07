@@ -217,6 +217,8 @@ pub(crate) mod async_inventory_ui {
         pub enum AsyncInventoryError {
             #[error("Tui Exiting process started, no state avalible")]
             NoAppStateAvalible,
+            #[error(transparent)]
+            Application(#[from] app::StaticsError),
         }
 
         impl AsyncInventoryUi {
@@ -226,11 +228,8 @@ pub(crate) mod async_inventory_ui {
                     previous: None,
                 });
 
-                let settings = app::statics::PineappleState::runtime()
-                    .block_on(app::statics::PineappleState::state())
-                    .as_ref()
-                    .ok_or(AsyncInventoryError::NoAppStateAvalible)?
-                    .settings();
+                let settings = app::PineappleState::runtime()
+                    .block_on(app::PineappleState::settings())?;
                 // inventory/main page and others next
                 todo!()
             }

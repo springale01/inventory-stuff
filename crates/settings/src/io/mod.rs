@@ -4,6 +4,10 @@ pub mod language_reader;
 pub mod settings_reader;
 pub mod text_file;
 
+pub use language_reader::{LanguageIO, LanguageModel};
+pub use settings_reader::{SettingsIO, SettingsModel};
+pub use text_file::TextFile;
+
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]

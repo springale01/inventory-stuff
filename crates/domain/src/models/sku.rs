@@ -1,4 +1,8 @@
-use std::{borrow::Cow, fmt, marker::PhantomData, str::FromStr, sync::atomic::AtomicUsize};
+use std::{fmt, str::FromStr};
+
+/// Compatibility path; new code can use `domain::CounterSkuBuilder` or `sku::counter`.
+pub use counter as sku_but_with_a_counter;
+pub use counter::{CounterExhausted, CounterSkuBuilder, CounterSkuSupplier, SkuFamily};
 
 /// A product code whose identity is its exact saved text, including casing.
 /// Build structured codes with SkuBuilder, or load existing codes with Sku::new.
@@ -106,6 +110,7 @@ impl SkuBuilder {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SkuType {
     Counted(Sku),
     Manual(Sku),
@@ -142,49 +147,43 @@ impl AsRef<str> for SkuType {
     }
 }
 
-// this one would be persistant and if you want a next up sku of a item you just call smt like ".next()"
-pub mod sku_but_with_a_counter {
+/// In-memory, thread-safe sequential SKU generation. Persist the sequence
+/// separately if it must survive application restarts.
+pub mod counter {
     use std::{
         borrow::Cow,
         marker::PhantomData,
-        sync::atomic::{
-            AtomicUsize,
-            Ordering::{AcqRel, Relaxed},
-        },
+        sync::atomic::{AtomicUsize, Ordering::Relaxed},
     };
 
     use crate::models::sku::{InvalidSku, Sku};
-    // T is Building and Finished, where Finished is immutable expect for the atomic usize or smt
-    pub(crate) struct CounterSkuBuilder<'a> {
+    /// Builds a prefix and an in-memory sequence. Fields may be borrowed or owned.
+    #[derive(Debug, Default)]
+    pub struct CounterSkuBuilder<'a> {
         fields: Vec<Cow<'a, str>>,
         start_at: Option<usize>,
     }
-    pub(crate) struct CounterSkuSupplier<T: SkuFamily> {
-        apples: Box<str>,
+    /// A validated SKU prefix and atomic sequence, labelled by a caller's family type.
+    pub struct CounterSkuSupplier<T: SkuFamily> {
+        prefix: Box<str>,
         counter: Counter,
-        // a marker so it shows what family of produce it makes
         _marker: PhantomData<fn() -> T>,
     }
+    /// A compile-time label for the kind of SKU supplied; it does not validate text.
     pub trait SkuFamily {}
-    pub(crate) struct Counter {
+    struct Counter {
         counter: AtomicUsize,
         padding: u8,
     }
     impl<'a> CounterSkuBuilder<'a> {
-        pub fn new(
-            size: Option<usize>,
-            start_at_atomic_usize: Option<usize>,
-        ) -> CounterSkuBuilder<'a> {
+        pub fn new(size: Option<usize>, start_at: Option<usize>) -> CounterSkuBuilder<'a> {
             let fields: Vec<Cow<'_, str>> = if let Some(size) = size {
                 Vec::with_capacity(size)
             } else {
                 vec![]
             };
 
-            CounterSkuBuilder::<'a> {
-                fields,
-                start_at: start_at_atomic_usize,
-            }
+            CounterSkuBuilder::<'a> { fields, start_at }
         }
     }
 
@@ -214,15 +213,15 @@ pub mod sku_but_with_a_counter {
             }
             let string = self.fields.join("-");
 
-            let thing = CounterSkuSupplier::<T> {
-                apples: string.into_boxed_str(),
+            let supplier = CounterSkuSupplier::<T> {
+                prefix: string.into_boxed_str(),
                 counter: Counter {
                     counter: AtomicUsize::new(self.start_at.unwrap_or(1)),
                     padding: padding.unwrap_or(4),
                 },
                 _marker: PhantomData,
             };
-            Ok(thing)
+            Ok(supplier)
         }
     }
 
@@ -231,8 +230,6 @@ pub mod sku_but_with_a_counter {
         T: SkuFamily,
     {
         pub fn supply(&self) -> Result<Sku, CounterExhausted> {
-            assert!(!self.apples.is_empty());
-
             let number = self
                 .counter
                 .counter
@@ -241,7 +238,7 @@ pub mod sku_but_with_a_counter {
 
             let width = usize::from(self.counter.padding);
 
-            let value = format!("{}-{number:0width$}", self.apples);
+            let value = format!("{}-{number:0width$}", self.prefix);
 
             Ok(Sku::new(value.into_boxed_str()).expect("Generated SKU should be valid"))
         }
