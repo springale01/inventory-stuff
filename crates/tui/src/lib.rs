@@ -1,16 +1,26 @@
-//! Terminal entry point. Pages own display state; the app crate owns use cases.
+#![doc = include_str!("../README.md")]
 pub mod clap_things;
 pub(crate) mod tools;
 pub mod widgets;
-pub mod workers;
-use settings::langs::LanguagePack;
-use std::{
-    io,
-    sync::{Arc, LazyLock},
+pub use widgets::{
+    inventory_page::{InventoryAction, InventoryPage, ItemRow},
+    inventory_ui::{InventoryUi, UiError},
+    page::{NavigationState, Page, PageId, UiAction},
 };
-use widgets::inventory_ui::InventoryUi;
 
 /// Initializes the terminal and restores it when the UI returns.
-pub fn run() -> io::Result<()> {
-    ratatui::run(|terminal| InventoryUi::new().run(terminal))
+pub async fn run() -> Result<(), UiError> {
+    let mut ui = InventoryUi::new().await?;
+    // Created before initialization to also restore after a partial init failure.
+    let _restore = RestoreTerminal;
+    let mut terminal = ratatui::try_init()?;
+    ui.run(&mut terminal).await
+}
+
+struct RestoreTerminal;
+
+impl Drop for RestoreTerminal {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
 }

@@ -1,4 +1,4 @@
-//! Inventory screen. State lives in MainPage; widgets are rebuilt each draw.
+//! Inventory screen. State lives in InventoryPage; widgets are rebuilt each draw.
 //!
 //! Extend it by adding fields for inputs/filters, updating them in handle_key,
 //! and splitting another Rect in draw. Keep database calls out of drawing.
@@ -10,33 +10,54 @@ use ratatui::{
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use super::inventory_ui::expirmental_inv_ui::{Page, UiAction};
+use super::{
+    page::{NavigationState, Page, PageId, UiAction},
+    sku::SkuClonglomerate,
+};
 use crate::tools::key::KeyMap;
+use app::domain::Sku;
+use settings::LanguagePack;
+use tokio::sync::watch;
 
 /// Display data for this count-based demo, not a replacement domain item model.
 /// Later, map the result of an app operation into these rows.
 pub struct ItemRow {
-    pub sku: String,
+    pub id: Box<str>,
+    pub sku: SkuClonglomerate,
+    pub description: Option<String>,
     pub name: String,
     pub quantity: u64,
     pub low_stock_at: u64,
 }
 
 impl ItemRow {
+    pub fn as_parts(&self) -> impl ExactSizeIterator<Item = &str> {
+        [
+            self.id.as_ref(),
+            self.sku.sku().as_str(),
+            self.name.as_str(),
+            self.description.as_deref().unwrap_or(""),
+        ]
+        .into_iter()
+    }
+
     fn is_low(&self) -> bool {
         self.quantity <= self.low_stock_at
     }
 }
 
 /// Owns everything the page remembers between frames.
-pub struct MainPage {
+pub struct InventoryPage {
     items: Vec<ItemRow>,
     // Stores both the selected row and the scrolling offset.
     table: TableState,
     help_open: bool,
+    navigation: Option<watch::Receiver<NavigationState>>,
+    keys: KeyMap<InventoryAction>,
+    demo: bool,
 }
 
-impl MainPage {
+impl InventoryPage {
     pub fn new(items: Vec<ItemRow>) -> Self {
         let mut table = TableState::default();
         table.select((!items.is_empty()).then_some(0));
@@ -44,46 +65,53 @@ impl MainPage {
             items,
             table,
             help_open: false,
+            navigation: None,
+            keys: default_keys(),
+            demo: false,
         }
     }
 
-    /// Replace this at startup with MainPage::new(your_display_rows).
+    /// Sample display data, explicitly labelled in the heading.
     pub fn demo() -> Self {
-        Self::new(vec![
-            ItemRow {
-                sku: "GPU-0001".into(),
-                name: "Graphics card".into(),
-                quantity: 12,
-                low_stock_at: 3,
-            },
-            ItemRow {
-                sku: "CBL-0001".into(),
-                name: "USB-C cable".into(),
-                quantity: 2,
-                low_stock_at: 5,
-            },
-            ItemRow {
-                sku: "KEY-0001".into(),
-                name: "Keyboard".into(),
-                quantity: 8,
-                low_stock_at: 2,
-            },
-            ItemRow {
-                sku: "MON-0001".into(),
-                name: "Monitor".into(),
-                quantity: 0,
-                low_stock_at: 2,
-            },
-        ])
+        let items = [
+            ("GPU-0001", "Graphics card", 12, 3),
+            ("CBL-0001", "USB-C cable", 2, 5),
+            ("KEY-0001", "Keyboard", 8, 2),
+            ("MON-0001", "Monitor", 0, 2),
+        ]
+        .into_iter()
+        .map(|(sku, name, quantity, low_stock_at)| ItemRow {
+            id: sku.into(),
+            sku: SkuClonglomerate::manual(Sku::new(sku).expect("demo SKU is valid")),
+            description: None,
+            name: name.into(),
+            quantity,
+            low_stock_at,
+        })
+        .collect();
+        let mut page = Self::new(items);
+        page.demo = true;
+        page
+    }
+
+    pub fn items(&self) -> &[ItemRow] {
+        &self.items
+    }
+    pub fn selected_index(&self) -> Option<usize> {
+        self.table.selected()
+    }
+    pub fn navigation(&self) -> Option<NavigationState> {
+        self.navigation.as_ref().map(|rx| *rx.borrow())
+    }
+    pub fn bind_key(&mut self, code: KeyCode, modifiers: KeyModifiers, action: InventoryAction) {
+        self.keys.bind(code, modifiers, action);
     }
 
     pub fn help_open(&self) -> bool {
         self.help_open
     }
 
-    /// The shell forwards key presses here. Add page-local actions in this match.
-    pub fn handle_key(&mut self, key: KeyEvent) {
-        // Modal input goes here first; arrows must not move the table behind help.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<UiAction> {
         if self.help_open {
             if matches!(
                 key.code,
@@ -91,16 +119,20 @@ impl MainPage {
             ) {
                 self.help_open = false;
             }
-            return;
+            return None;
         }
-        match key.code {
-            KeyCode::Char('?') => self.help_open = true,
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(true),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(false),
-            KeyCode::Home if !self.items.is_empty() => self.table.select(Some(0)),
-            KeyCode::End if !self.items.is_empty() => self.table.select(Some(self.items.len() - 1)),
+        match self.keys.action(key).copied()? {
+            InventoryAction::NextItem => self.move_selection(true),
+            InventoryAction::PreviousItem => self.move_selection(false),
+            InventoryAction::FirstItem if !self.items.is_empty() => self.table.select(Some(0)),
+            InventoryAction::LastItem if !self.items.is_empty() => {
+                self.table.select(Some(self.items.len() - 1))
+            }
+            InventoryAction::OpenHelp => self.help_open = true,
+            InventoryAction::Quit => return Some(UiAction::Quit),
             _ => {}
         }
+        None
     }
 
     fn move_selection(&mut self, down: bool) {
@@ -119,7 +151,7 @@ impl MainPage {
 
     /// Layout is a tree of rectangles. Each helper draws into its assigned area.
     /// This renders display state; it never mutates inventory or queries SQL.
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, language: &LanguagePack) {
         if area.width < 40 || area.height < 18 {
             frame.render_widget(
                 Paragraph::new("Enlarge terminal to at least 40 x 18.\nq: quit | ?: help")
@@ -141,13 +173,17 @@ impl MainPage {
         ])
         .areas(area);
         frame.render_widget(
-            Paragraph::new(" INVENTORY / Overview / SAMPLE DATA")
-                .style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .block(Block::bordered()),
+            Paragraph::new(format!(
+                " {} / Overview{}",
+                PageId::InventoryPage.label(language),
+                if self.demo { " / SAMPLE DATA" } else { "" }
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::bordered()),
             header,
         );
         self.draw_summary(frame, summary);
@@ -203,7 +239,7 @@ impl MainPage {
                 Color::Green
             };
             Row::new(vec![
-                Cell::from(item.sku.as_str()),
+                Cell::from(item.sku.sku().as_str()),
                 Cell::from(item.name.as_str()),
                 Cell::from(item.quantity.to_string()),
                 Cell::from(if item.is_low() { "LOW" } else { "OK" })
@@ -245,7 +281,10 @@ impl MainPage {
         {
             Some(item) => format!(
                 "{}\nSKU: {}\nQuantity: {} | Low at: {}",
-                item.name, item.sku, item.quantity, item.low_stock_at
+                item.name,
+                item.sku.sku(),
+                item.quantity,
+                item.low_stock_at
             ),
             None => "Select an item to inspect it.".into(),
         };
@@ -272,21 +311,21 @@ impl MainPage {
         .areas(middle);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new("Up/Down or j/k: select an item\nHome/End: first/last item\n?: open help\nEsc, q or ?: close help\nq outside help: quit\n\nSample data only; no stock is changed.")
+            Paragraph::new("Up/Down or j/k: select an item\nHome/End: first/last item\n?: open help\nEsc, q or ?: close help\nq outside help: quit")
                 .wrap(Wrap { trim: true })
                 .block(Block::bordered().title("Help").border_style(Style::default().fg(Color::Cyan))), popup,
         );
     }
 }
-/// Key bindings produce actions; the page applies them to its persistent state.
-/// Reuses the original page's rendering and table state during the experiment.
-pub struct MainPageV2 {
-    page: MainPage,
-    keys: KeyMap<MainAction>,
+
+impl Default for InventoryPage {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MainAction {
+pub enum InventoryAction {
     NextItem,
     PreviousItem,
     FirstItem,
@@ -295,70 +334,39 @@ pub enum MainAction {
     Quit,
 }
 
-impl MainPageV2 {
-    pub fn new(items: Vec<ItemRow>) -> Self {
-        Self::with_page(MainPage::new(items))
+fn default_keys() -> KeyMap<InventoryAction> {
+    let mut keys = KeyMap::default();
+    for (code, action) in [
+        (KeyCode::Down, InventoryAction::NextItem),
+        (KeyCode::Char('j'), InventoryAction::NextItem),
+        (KeyCode::Up, InventoryAction::PreviousItem),
+        (KeyCode::Char('k'), InventoryAction::PreviousItem),
+        (KeyCode::Home, InventoryAction::FirstItem),
+        (KeyCode::End, InventoryAction::LastItem),
+        (KeyCode::Char('?'), InventoryAction::OpenHelp),
+        (KeyCode::Char('q'), InventoryAction::Quit),
+    ] {
+        keys.bind(code, KeyModifiers::NONE, action);
     }
-
-    pub fn demo() -> Self {
-        Self::with_page(MainPage::demo())
-    }
-
-    fn with_page(page: MainPage) -> Self {
-        let mut result = Self {
-            page,
-            keys: KeyMap::default(),
-        };
-        for (code, action) in [
-            (KeyCode::Down, MainAction::NextItem),
-            (KeyCode::Char('j'), MainAction::NextItem),
-            (KeyCode::Up, MainAction::PreviousItem),
-            (KeyCode::Char('k'), MainAction::PreviousItem),
-            (KeyCode::Home, MainAction::FirstItem),
-            (KeyCode::End, MainAction::LastItem),
-            (KeyCode::Char('?'), MainAction::OpenHelp),
-            (KeyCode::Char('q'), MainAction::Quit),
-        ] {
-            result.bind_key(code, KeyModifiers::NONE, action);
-        }
-        // Terminals can report '?' with or without the Shift modifier.
-        result.bind_key(
-            KeyCode::Char('?'),
-            KeyModifiers::SHIFT,
-            MainAction::OpenHelp,
-        );
-        result
-    }
-
-    pub fn bind_key(&mut self, code: KeyCode, modifiers: KeyModifiers, action: MainAction) {
-        self.keys.bind(code, modifiers, action);
-    }
+    keys.bind(
+        KeyCode::Char('?'),
+        KeyModifiers::SHIFT,
+        InventoryAction::OpenHelp,
+    );
+    keys
 }
 
-impl Page for MainPageV2 {
-    fn handle_key(&mut self, key: KeyEvent) -> Option<UiAction> {
-        // The page owns its help overlay. It consumes all input while open,
-        // preventing navigation or quitting through the modal.
-        if self.page.help_open {
-            self.page.handle_key(key);
-            return None;
-        }
-        match self.keys.action(key).copied()? {
-            MainAction::NextItem => self.page.move_selection(true),
-            MainAction::PreviousItem => self.page.move_selection(false),
-            MainAction::FirstItem if !self.page.items.is_empty() => self.page.table.select(Some(0)),
-            MainAction::LastItem if !self.page.items.is_empty() => {
-                self.page.table.select(Some(self.page.items.len() - 1))
-            }
-            MainAction::OpenHelp => self.page.help_open = true,
-            MainAction::Quit => return Some(UiAction::Quit),
-            _ => {}
-        }
-        None
+impl Page for InventoryPage {
+    fn subscribe(&mut self, navigation: watch::Receiver<NavigationState>) {
+        self.navigation = Some(navigation);
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        self.page.draw(frame, area);
+    fn handle_key(&mut self, key: KeyEvent) -> Option<UiAction> {
+        InventoryPage::handle_key(self, key)
+    }
+
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, language: &LanguagePack) {
+        InventoryPage::draw(self, frame, area, language);
     }
 }
 
@@ -372,51 +380,50 @@ mod tests {
     }
 
     #[test]
-    fn v2_navigation_modals_and_custom_bindings_update_the_page() {
-        let mut page = MainPageV2::demo();
-        assert_eq!(page.page.table.selected(), Some(0));
+    fn navigation_help_and_custom_bindings_preserve_their_behavior() {
+        let mut page = InventoryPage::demo();
         page.handle_key(key(KeyCode::Down));
-        assert_eq!(page.page.table.selected(), Some(1));
+        assert_eq!(page.selected_index(), Some(1));
         page.handle_key(key(KeyCode::Char('?')));
-        assert!(page.page.help_open);
+        assert!(page.help_open());
         page.handle_key(key(KeyCode::Down));
-        assert_eq!(page.page.table.selected(), Some(1));
+        assert_eq!(page.selected_index(), Some(1));
         assert!(page.handle_key(key(KeyCode::Char('q'))).is_none());
-        assert!(!page.page.help_open);
+        assert!(!page.help_open());
         page.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
-        assert_eq!(page.page.table.selected(), Some(1));
+        assert_eq!(page.selected_index(), Some(1));
         page.bind_key(
             KeyCode::Char('n'),
             KeyModifiers::CONTROL,
-            MainAction::NextItem,
+            InventoryAction::NextItem,
         );
         page.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_eq!(page.page.table.selected(), Some(2));
+        assert_eq!(page.selected_index(), Some(2));
         page.handle_key(key(KeyCode::End));
-        assert_eq!(page.page.table.selected(), Some(3));
         page.handle_key(key(KeyCode::Down));
-        assert_eq!(page.page.table.selected(), Some(3));
+        assert_eq!(page.selected_index(), Some(3));
         page.handle_key(key(KeyCode::Home));
         page.handle_key(key(KeyCode::Up));
-        assert_eq!(page.page.table.selected(), Some(0));
-        assert!(matches!(
+        assert_eq!(page.selected_index(), Some(0));
+        assert_eq!(
             page.handle_key(key(KeyCode::Char('q'))),
             Some(UiAction::Quit)
-        ));
+        );
     }
 
     #[test]
-    fn v2_renders_without_input_and_empty_tables_stay_unselected() {
-        let mut page = MainPageV2::new(Vec::new());
+    fn empty_tables_render_without_input_and_small_terminals_do_not_panic() {
+        let mut page = InventoryPage::default();
         for code in [KeyCode::Home, KeyCode::End, KeyCode::Down, KeyCode::Up] {
             page.handle_key(key(code));
         }
-        assert_eq!(page.page.table.selected(), None);
+        assert_eq!(page.selected_index(), None);
         let mut terminal = Terminal::new(TestBackend::new(90, 25)).unwrap();
+        let pack = LanguagePack::default();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                page.draw(frame, area);
+                page.draw(frame, area, &pack);
             })
             .unwrap();
         let screen: String = terminal
@@ -427,5 +434,42 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(screen.contains("No items yet."));
+        terminal.resize(Rect::new(0, 0, 10, 3)).unwrap();
+        page.handle_key(key(KeyCode::Char('?')));
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                page.draw(frame, area, &pack);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn rows_keep_owned_skus_and_display_parts_after_their_supplier_expires() {
+        use super::super::sku::SkuSupplierRegistry;
+        use app::domain::{CounterSkuBuilder, SkuFamily};
+        struct Hardware;
+        impl SkuFamily for Hardware {}
+        let mut registry = SkuSupplierRegistry::default();
+        let id = registry.register(std::sync::Arc::new(
+            CounterSkuBuilder::default()
+                .add("BOLT")
+                .build::<Hardware>(None)
+                .unwrap(),
+        ));
+        let row = ItemRow {
+            id: "item".into(),
+            sku: registry.generate(id).unwrap(),
+            name: "Bolts".into(),
+            description: Some("M8".into()),
+            quantity: 3,
+            low_stock_at: 1,
+        };
+        registry.remove(id);
+        assert!(row.sku.supplier().is_none());
+        assert_eq!(
+            row.as_parts().collect::<Vec<_>>(),
+            ["item", "BOLT-0001", "Bolts", "M8"]
+        );
     }
 }

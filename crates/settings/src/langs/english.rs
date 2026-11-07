@@ -9,6 +9,8 @@ pub static ENGLISH_DICT: LazyLock<HashMap<TextKey, &'static str>> = LazyLock::ne
     let mut map = HashMap::new();
 
     map.insert(TextKey::TuiName, "Inventory Manager");
+    map.insert(TextKey::InventoryPageTitle, "Inventory");
+    map.insert(TextKey::SettingsPageTitle, "Settings");
 
     map
 });

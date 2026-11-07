@@ -1,69 +1,92 @@
-# Inventory TUI starter
+# Inventory TUI
 
-Run from the workspace root:
+The terminal UI uses one async coordinator and one inventory page. Run from the
+workspace root with `cargo run -p tui`, optionally passing
+`--settings-location config/settings.toml`.
 
-```sh
-cargo run -p tui
+The executable parses arguments, awaits application initialization, runs the UI,
+restores the terminal, then awaits application shutdown. Rendering is synchronous;
+waiting for input and shell requests is asynchronous.
+
+| Module | Responsibility |
+| --- | --- |
+| `widgets/inventory_ui.rs` | Async event loop, page registry, requests, navigation watch, supplier ownership |
+| `widgets/page.rs` | `Page`, `PageId`, `NavigationState`, and `UiAction` |
+| `widgets/inventory_page.rs` | Rows, table selection, layout, details, help, and key bindings |
+| `widgets/sku.rs` | Domain-typed supplier IDs, strong registry references, and weak row origins |
+| `tools/key.rs` | Maps key chords to page actions |
+
+Public UI types are also exported from the crate root. The older `MainPage`, V2,
+and nested experimental UI implementations have been removed.
+
+## Ownership and navigation
+
+`InventoryUi` owns its pages, `Arc<Settings>`, and `SkuSupplierRegistry`. Pages do
+not borrow the shell's fields. Each registered page receives a navigation watch
+subscription. Only the current page gets key events and rendering calls.
+
+`NavigationState` publishes current and previous page together. Same-page
+navigation leaves history unchanged; a missing destination returns `UiError`
+without changing the state. `Back` visits the single previous page, not a full
+history stack. Popups belong to the inventory page and do not change navigation.
+
+The page map uses stable `PageId` keys. `PageId::as_str()` is independent of the
+selected language; `label(pack)` looks up a translated heading. The shell loads
+one language snapshot per render, and refreshes periodically so language changes
+appear while input is idle.
+
+```rust,no_run
+use std::sync::Arc;
+use settings::Settings;
+use tui::{InventoryPage, InventoryUi, PageId, UiAction};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let mut ui = InventoryUi::with_settings(Arc::new(Settings::default()));
+// Replace the sample page with your own display rows.
+ui.register_page(PageId::InventoryPage, InventoryPage::new(Vec::new()));
+let navigation = ui.subscribe_navigation();
+let requests = ui.requests();
+let page = ui.page_mut::<InventoryPage>(PageId::InventoryPage).unwrap();
+assert!(page.items().is_empty());
+// From a task running alongside ui.run(...):
+requests.send(UiAction::Redraw).await?;
+# Ok(())
+# }
 ```
 
-This is a display-only starter with sample count-based items. It does not query
-the database or change stock. The summary labels its count as **item types**,
-rather than adding together quantities of unrelated products.
+Only the inventory page is registered initially. Register other pages before
+requesting navigation to them. `page::<T>` and `page_mut::<T>` perform checked
+downcasts for shell operations needing a page's concrete methods; a mismatched
+type returns `None`.
 
-```text
-InventoryUi (owns terminal loop and MainPage)
-  MainPage (owns item rows, TableState, help visibility)
-    header
-    summary
-    body: item table + selected item details
-    footer
-    optional help overlay, drawn last
-```
+## Events and rendering
 
-`main_page.rs` has the page state, layout, drawing helpers, and local key handling.
-`inventory_ui.rs` reads terminal events and forwards key presses to the page.
-`lib.rs` initializes/restores the terminal; `main.rs` makes the crate executable.
-The earlier `Widgets` trait is still available but this screen doesn't need it.
+The event loop selects between Crossterm's `EventStream`, a bounded Tokio request
+channel, and a refresh timer. Channel actions can wake it without keyboard input.
+There are no blocking `event::read()` calls or nested `block_on` calls in the UI.
+`run_with_events` accepts an injected event stream and terminal backend for tests.
+End of input exits normally; event and drawing errors propagate through `UiError`.
 
-## Add another panel
+Pages return shell actions from `handle_key`; their synchronous `draw` receives a
+frame, rectangle, and borrowed language pack. Keep filesystem/database operations
+out of drawing. Extend `UiAction` and the shell dispatcher when adding typed
+background operation results; the existing inbox carries navigation/redraw/quit
+actions rather than inventory data.
 
-1. Add a field to `MainPage` if the panel needs to remember something.
-2. In `draw`, split an existing rectangle with `Layout::horizontal` or `vertical`.
-3. Write a `draw_your_panel(&self, frame: &mut Frame, area: Rect)` helper.
-4. Call it with the new rectangle. Use `&mut self` if rendering needs mutable state.
+The default screen still shows labelled sample count-based rows. It does not
+query the database or change stock. Replace it with `InventoryPage::new(rows)`
+when connecting real application results. SKU values and optional weak supplier
+origins are part of each `ItemRow`; the shell owns the strong supplier registry.
+See the `widgets::sku` documentation for a complete generation example.
 
-For example, replace the body split with three sections for a table, details,
-and activity log. Keep each helper concerned only with its own rectangle.
-
-## Add a table column
-
-Add the display field to `ItemRow`, then update the cells, width constraints,
-and header in `draw_table`. For example, a location column needs all three.
-
-## Add a key action
-
-Add a match arm to `MainPage::handle_key`. Page state changes there; the next
-draw reflects it. For a popup, store its open/closed state, draw it last after
-`Clear`, and give it input before the underlying page (see the help popup).
-When adding editable text, route input to the focused field before global keys
-so typing `q` doesn't quit.
-
-## Connect real data
-
-Replace `MainPage::demo()` in `InventoryUi::new()` with
-`MainPage::new(rows_from_your_app)`. These rows are display values; domain
-validation and stock updates stay behind the app API. The header currently
-says SAMPLE DATA; change that when the data source changes.
-
-The event loop currently blocks on terminal input/resize. To receive background
-worker updates, extend it to also wake for those messages, e.g. an async event
-stream alongside the worker receiver. Don't call blocking `event::read()`
-directly inside a Tokio async task. Don't query the database on every draw.
-
-## Controls and sizing
+## Controls and layout
 
 - Up/Down or j/k: select; Home/End: first/last item.
 - ?: open help; Esc, q, or ?: close help. Other keys stay within the modal.
-- q outside help: quit.
+- q outside help: quit. Ctrl+C exits from any page or popup.
 - At 90 columns or wider, details sit beside the table; otherwise below it.
 - Below 40 columns or 18 rows, an enlarge-terminal message replaces the page.
+
+Add fields to `ItemRow` and update table cells, widths, and headers together when
+adding columns. Page state persists between draws; widgets are rebuilt each frame.
+`bind_key` customizes the page's action map without boxed callbacks.

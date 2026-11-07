@@ -70,6 +70,7 @@ Async entry points use `app::initialize(path).await` and
 `PineappleState::shutdown_global().await` on the caller's runtime. Keep that runtime
 alive until shutdown. Calling the synchronous startup/shutdown wrappers inside a
 Tokio runtime returns `StaticsError::AsyncContext` instead of nesting `block_on`.
+The TUI executable uses these async entry points and awaits `tui::run()` between them.
 
 Initialization is once per process. Failed startup leaves the slot available for
 retry. Repeated/concurrent initialization returns `AlreadyInitialized` without

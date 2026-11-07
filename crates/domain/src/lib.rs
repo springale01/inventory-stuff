@@ -9,7 +9,7 @@ pub use models::{
     movement::{AddCmd, MovementEvent, MovementKind, RemoveCmd},
     sku::{
         CounterExhausted, CounterSkuBuilder, CounterSkuSupplier, InvalidSku, Sku, SkuBuilder,
-        SkuFamily, SkuType,
+        SkuFamily, SkuSupplier, SkuType,
     },
     stock::{Item, Stock, StockAmount, StockError, StockUnit},
 };

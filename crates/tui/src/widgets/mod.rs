@@ -1,10 +1,6 @@
-use std::any::Any;
-pub mod add_page;
-pub(crate) mod inventory_ui;
-pub mod main_page;
-pub trait Widgets: Any + Send {
-    type Error: Send;
+//! UI coordinator, page contracts, inventory rendering, and SKU supplier state.
 
-    fn layer(&self) -> u8;
-    fn is_active(&self) -> bool;
-}
+pub mod inventory_page;
+pub mod inventory_ui;
+pub mod page;
+pub mod sku;

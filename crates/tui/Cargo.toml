@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 ratatui.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio.workspace = true
 app = { path = "../app" }
 settings = { path = "../settings" }

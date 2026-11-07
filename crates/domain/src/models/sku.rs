@@ -146,6 +146,25 @@ impl AsRef<str> for SkuType {
         }
     }
 }
+/// Produces SKU candidates. Supplying a candidate may advance an in-memory
+/// sequence; it does not reserve or persist the code in a database.
+pub trait SkuSupplier {
+    type Output;
+    type Error;
+
+    fn supply(&self) -> Result<Self::Output, Self::Error>;
+}
+impl<T> SkuSupplier for CounterSkuSupplier<T>
+where
+    T: SkuFamily,
+{
+    type Error = CounterExhausted;
+    type Output = Sku;
+
+    fn supply(&self) -> Result<Self::Output, Self::Error> {
+        CounterSkuSupplier::supply(self)
+    }
+}
 
 /// In-memory, thread-safe sequential SKU generation. Persist the sequence
 /// separately if it must survive application restarts.

@@ -29,7 +29,9 @@ Language selection is saved as a source, separately from its display name. Share
 `Arc<Settings>` for ongoing access and load one language snapshot per render.
 Previously returned `Arc<LanguagePack>` snapshots keep their original pack.
 
-The async page experiment remains separate from the running demo UI. Page labels
-and worker results still need to be connected to that experiment's event loop.
+The TUI now runs the async page coordinator, with navigation watches and a shell
+request channel. Its inventory screen still displays labelled sample data;
+database result messages can be added to the shell dispatcher when connecting it.
+See the [TUI module and event-loop guide](crates/tui/README.md).
 
 Run `cargo test --workspace` to check the workspace and its public examples.
