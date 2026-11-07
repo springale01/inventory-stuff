@@ -45,8 +45,13 @@ impl PineappleState {
         &RUNTIME
     }
 
-    pub async fn state(&self) -> RwLockReadGuard<'_, Option<AppState>> {
-        self.0.read().await
+    pub async fn state() -> RwLockReadGuard<'static, Option<AppState>> {
+        APPSTATE
+            .get()
+            .expect("Should have been initialized already ; - ;")
+            .0
+            .read()
+            .await
     }
 
     pub async fn shutdown(&self) -> Result<(), StaticsError> {

@@ -11,3 +11,4 @@ app = { path = "../app" }
 settings = { path = "../settings" }
 dotenvy.workspace = true
 clap.workspace = true
+thiserror.workspace = true

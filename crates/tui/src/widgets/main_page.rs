@@ -2,7 +2,7 @@
 //!
 //! Extend it by adding fields for inputs/filters, updating them in handle_key,
 //! and splitting another Rect in draw. Keep database calls out of drawing.
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -10,7 +10,8 @@ use ratatui::{
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::tools::key::KeyHandler;
+use super::inventory_ui::expirmental_inv_ui::{Page, UiAction};
+use crate::tools::key::KeyMap;
 
 /// Display data for this count-based demo, not a replacement domain item model.
 /// Later, map the result of an app operation into these rows.
@@ -277,16 +278,154 @@ impl MainPage {
         );
     }
 }
-// ----- Expriments -----
+/// Key bindings produce actions; the page applies them to its persistent state.
+/// Reuses the original page's rendering and table state during the experiment.
 pub struct MainPageV2 {
-    items: ItemRow,
-    table: TableState,
+    page: MainPage,
+    keys: KeyMap<MainAction>,
 }
 
-struct MainPageKeyHandler {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainAction {
+    NextItem,
+    PreviousItem,
+    FirstItem,
+    LastItem,
+    OpenHelp,
+    Quit,
+}
 
-impl KeyHandler for MainPageKeyHandler {
-    fn handle_key(&self, key: crossterm::event::KeyEvent) -> () {
-        todo!()
+impl MainPageV2 {
+    pub fn new(items: Vec<ItemRow>) -> Self {
+        Self::with_page(MainPage::new(items))
+    }
+
+    pub fn demo() -> Self {
+        Self::with_page(MainPage::demo())
+    }
+
+    fn with_page(page: MainPage) -> Self {
+        let mut result = Self {
+            page,
+            keys: KeyMap::default(),
+        };
+        for (code, action) in [
+            (KeyCode::Down, MainAction::NextItem),
+            (KeyCode::Char('j'), MainAction::NextItem),
+            (KeyCode::Up, MainAction::PreviousItem),
+            (KeyCode::Char('k'), MainAction::PreviousItem),
+            (KeyCode::Home, MainAction::FirstItem),
+            (KeyCode::End, MainAction::LastItem),
+            (KeyCode::Char('?'), MainAction::OpenHelp),
+            (KeyCode::Char('q'), MainAction::Quit),
+        ] {
+            result.bind_key(code, KeyModifiers::NONE, action);
+        }
+        // Terminals can report '?' with or without the Shift modifier.
+        result.bind_key(
+            KeyCode::Char('?'),
+            KeyModifiers::SHIFT,
+            MainAction::OpenHelp,
+        );
+        result
+    }
+
+    pub fn bind_key(&mut self, code: KeyCode, modifiers: KeyModifiers, action: MainAction) {
+        self.keys.bind(code, modifiers, action);
+    }
+}
+
+impl Page for MainPageV2 {
+    fn handle_key(&mut self, key: KeyEvent) -> Option<UiAction> {
+        // The page owns its help overlay. It consumes all input while open,
+        // preventing navigation or quitting through the modal.
+        if self.page.help_open {
+            self.page.handle_key(key);
+            return None;
+        }
+        match self.keys.action(key).copied()? {
+            MainAction::NextItem => self.page.move_selection(true),
+            MainAction::PreviousItem => self.page.move_selection(false),
+            MainAction::FirstItem if !self.page.items.is_empty() => self.page.table.select(Some(0)),
+            MainAction::LastItem if !self.page.items.is_empty() => {
+                self.page.table.select(Some(self.page.items.len() - 1))
+            }
+            MainAction::OpenHelp => self.page.help_open = true,
+            MainAction::Quit => return Some(UiAction::Quit),
+            _ => {}
+        }
+        None
+    }
+
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.page.draw(frame, area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn v2_navigation_modals_and_custom_bindings_update_the_page() {
+        let mut page = MainPageV2::demo();
+        assert_eq!(page.page.table.selected(), Some(0));
+        page.handle_key(key(KeyCode::Down));
+        assert_eq!(page.page.table.selected(), Some(1));
+        page.handle_key(key(KeyCode::Char('?')));
+        assert!(page.page.help_open);
+        page.handle_key(key(KeyCode::Down));
+        assert_eq!(page.page.table.selected(), Some(1));
+        assert!(page.handle_key(key(KeyCode::Char('q'))).is_none());
+        assert!(!page.page.help_open);
+        page.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(page.page.table.selected(), Some(1));
+        page.bind_key(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+            MainAction::NextItem,
+        );
+        page.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(page.page.table.selected(), Some(2));
+        page.handle_key(key(KeyCode::End));
+        assert_eq!(page.page.table.selected(), Some(3));
+        page.handle_key(key(KeyCode::Down));
+        assert_eq!(page.page.table.selected(), Some(3));
+        page.handle_key(key(KeyCode::Home));
+        page.handle_key(key(KeyCode::Up));
+        assert_eq!(page.page.table.selected(), Some(0));
+        assert!(matches!(
+            page.handle_key(key(KeyCode::Char('q'))),
+            Some(UiAction::Quit)
+        ));
+    }
+
+    #[test]
+    fn v2_renders_without_input_and_empty_tables_stay_unselected() {
+        let mut page = MainPageV2::new(Vec::new());
+        for code in [KeyCode::Home, KeyCode::End, KeyCode::Down, KeyCode::Up] {
+            page.handle_key(key(code));
+        }
+        assert_eq!(page.page.table.selected(), None);
+        let mut terminal = Terminal::new(TestBackend::new(90, 25)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                page.draw(frame, area);
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("No items yet."));
     }
 }

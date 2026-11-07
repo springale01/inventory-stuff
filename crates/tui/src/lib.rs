@@ -3,7 +3,11 @@ pub mod clap_things;
 pub(crate) mod tools;
 pub mod widgets;
 pub mod workers;
-use std::io;
+use settings::langs::LanguagePack;
+use std::{
+    io,
+    sync::{Arc, LazyLock},
+};
 use widgets::inventory_ui::InventoryUi;
 
 /// Initializes the terminal and restores it when the UI returns.
