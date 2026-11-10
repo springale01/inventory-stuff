@@ -55,6 +55,7 @@ pub struct InventoryPage {
     navigation: Option<watch::Receiver<NavigationState>>,
     keys: KeyMap<InventoryAction>,
     demo: bool,
+    editor: Option<ItemEditor>,
 }
 
 impl InventoryPage {
@@ -68,6 +69,7 @@ impl InventoryPage {
             navigation: None,
             keys: default_keys(),
             demo: false,
+            editor: None,
         }
     }
 
@@ -130,6 +132,15 @@ impl InventoryPage {
             }
             InventoryAction::OpenHelp => self.help_open = true,
             InventoryAction::Quit => return Some(UiAction::Quit),
+            InventoryAction::Edit => {
+                if let Some(item) = self
+                    .table
+                    .selected()
+                    .and_then(|index| self.items.get(index))
+                {
+                    ()
+                }
+            }
             _ => {}
         }
         None
@@ -316,6 +327,16 @@ impl InventoryPage {
                 .block(Block::bordered().title("Help").border_style(Style::default().fg(Color::Cyan))), popup,
         );
     }
+
+    fn draw_edit(&self, fram: &mut Frame, area: Rect) {
+        ()
+    }
+}
+
+struct ItemEditor {
+    item_id: Box<str>,
+    name: String,
+    error: Option<String>,
 }
 
 impl Default for InventoryPage {
@@ -332,6 +353,7 @@ pub enum InventoryAction {
     LastItem,
     OpenHelp,
     Quit,
+    Edit,
 }
 
 fn default_keys() -> KeyMap<InventoryAction> {
@@ -345,6 +367,7 @@ fn default_keys() -> KeyMap<InventoryAction> {
         (KeyCode::End, InventoryAction::LastItem),
         (KeyCode::Char('?'), InventoryAction::OpenHelp),
         (KeyCode::Char('q'), InventoryAction::Quit),
+        (KeyCode::Char('e'), InventoryAction::Edit),
     ] {
         keys.bind(code, KeyModifiers::NONE, action);
     }
