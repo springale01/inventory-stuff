@@ -35,3 +35,7 @@ database result messages can be added to the shell dispatcher when connecting it
 See the [TUI module and event-loop guide](crates/tui/README.md).
 
 Run `cargo test --workspace` to check the workspace and its public examples.
+
+Notes on AI usage:
+I used AI mostly to generate the docs and some code but the idea is mostly original, I did ask
+for help during the TUI and other design processes though.
